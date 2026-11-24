@@ -1,0 +1,10 @@
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.sys
+*.log
+*.ilk
+2_src_port/int_*.obj
