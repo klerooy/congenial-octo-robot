@@ -38,8 +38,6 @@ cl %CFLAGS% /c rr_classscan.c /Fo:int_classscan.obj || goto fail
 cl %CFLAGS% /c rr_find.c /Fo:int_find.obj || goto fail
 cl %CFLAGS% /c rr_int_cfg.c /Fo:int_cfg.obj || goto fail
 cl %CFLAGS% /c rr_aim.c /Fo:int_aim.obj || goto fail
-cl %CFLAGS% /c rr_recoil.c /Fo:int_recoil.obj || goto fail
-cl %CFLAGS% /c rr_antiaim.c /Fo:int_antiaim.obj || goto fail
 cl %CFLAGS% /c rr_int_glue.c /Fo:int_glue.obj || goto fail
 cl %CFLAGS% /c rr_input_gate.c /Fo:int_gate.obj || goto fail
 

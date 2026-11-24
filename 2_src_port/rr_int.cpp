@@ -47,10 +47,10 @@
 #include "rr_mem.h"
 #include "rr_game.h"
 #include "rr_aim.h"
-#include "rr_antiaim.h"
 #include "rr_esp_style.h"
 #include "menu_bridge.h"
 #include "rr_input_gate.h"
+#include "rr_antiaim.h"
 
 #define RR_INT_LOG   "C:\\Users\\Public\\rr_int.log"
 #define RR_INT_INI   "C:\\Users\\Public\\rr_int.ini"
@@ -771,7 +771,7 @@ static void menu_text(int row, wchar_t* label, wchar_t* value, size_t cap) {
     case M_AA:       _snwprintf_s(label, cap, _TRUNCATE, L"anti-aim");   MENU_ONOFF(g_cfg.aa); break;
     case M_AAMODE:
         _snwprintf_s(label, cap, _TRUNCATE, L"aa mode");
-        _snwprintf_s(value, cap, _TRUNCATE, L"%s", aa_label(g_cfg.aa_mode));
+        _snwprintf_s(value, cap, _TRUNCATE, L"removed");
         break;
     case M_AASPD:
         _snwprintf_s(label, cap, _TRUNCATE, L"aa speed");
@@ -909,7 +909,7 @@ static void menu_set(int row, int dir, int act) {
     case M_AA:       if (toggle) g_cfg.aa = !g_cfg.aa; break;
     case M_AAMODE:
         if (dir || act)
-            g_cfg.aa_mode = (g_cfg.aa_mode + (dir ? dir : 1) + 4) % 4;
+            g_cfg.aa_mode = RR_ANTIAIM_STATIC;
         break;
     case M_AASPD:
         if (dir) {
@@ -2020,6 +2020,216 @@ static void ign_draw(float W, float H) {
     }
 }
 
+/* ---- AIM panel -----------------------------------------------------------
+ * Replaces the old AIM tab. Four controls only: enable, bone, FOV, smoothing,
+ * plus nospread. No calibration: the magnet measures sensitivity itself. */
+
+static float g_aim_anim[2] = { 0.0f, 0.0f };   /* enable, nospread toggles */
+static int   g_aim_lmb = 0;
+static DWORD g_aim_last = 0;
+static int   g_aim_drag = -1;                  /* 0 = fov, 1 = smooth */
+
+static const wchar_t* const bone_name[RR_AIM_GROUP_COUNT] = {
+    L"Head", L"Neck", L"Chest", L"Pelvis", L"Closest",
+    L"Arms", L"Legs", L"Face", L"Hands", L"Feet"
+};
+
+typedef struct { float x, y, w, h; } AIM_RECT;
+
+static AIM_RECT aim_panel(float W, float H) {
+    AIM_RECT r;
+    r.w = 320.0f; r.h = 236.0f;
+    r.x = W - r.w - 24.0f;
+    r.y = 24.0f;
+    if (r.x < 8.0f) r.x = 8.0f;
+    if (r.y + r.h > H - 24.0f) r.y = H - r.h - 24.0f;
+    if (r.y < 8.0f) r.y = 8.0f;
+    return r;
+}
+
+static AIM_RECT aim_row(AIM_RECT s, int k) {
+    AIM_RECT r = s;
+    r.x = s.x + 12.0f;
+    r.w = s.w - 24.0f;
+    r.y = s.y + 32.0f + (float)k * 30.0f;
+    r.h = 26.0f;
+    return r;
+}
+
+static int aim_hit(AIM_RECT r, float x, float y) {
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+}
+
+/* Slider track occupies the right half of a row. */
+static AIM_RECT aim_track(AIM_RECT row) {
+    AIM_RECT t;
+    t.w = 130.0f; t.h = 6.0f;
+    t.x = row.x + row.w - t.w;
+    t.y = row.y + row.h * 0.5f - t.h * 0.5f;
+    return t;
+}
+
+static void aim_slider_draw(AIM_RECT row, float frac, UINT32 accent,
+                            const wchar_t* label, int value, const wchar_t* unit) {
+    if (g_fmt_l) {
+        D2D1_RECT_F lr = D2D1::RectF(row.x, row.y + 3.0f,
+                                     row.x + 120.0f, row.y + row.h - 3.0f);
+        text_in(label, lr, 0xFFC8D0D8, g_fmt_l);
+    }
+    const AIM_RECT t = aim_track(row);
+    D2D1_ROUNDED_RECT bg = D2D1::RoundedRect(
+        D2D1::RectF(t.x, t.y, t.x + t.w, t.y + t.h), 3.0f, 3.0f);
+    g_brush->SetColor(col(0xFF2A3138, 1.0f));
+    g_d2d_ctx->FillRoundedRectangle(bg, g_brush);
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    if (frac > 0.001f) {
+        D2D1_ROUNDED_RECT fg = D2D1::RoundedRect(
+            D2D1::RectF(t.x, t.y, t.x + t.w * frac, t.y + t.h), 3.0f, 3.0f);
+        g_brush->SetColor(col(accent | 0xFF000000u, 1.0f));
+        g_d2d_ctx->FillRoundedRectangle(fg, g_brush);
+    }
+    const float kx = t.x + t.w * frac;
+    g_brush->SetColor(col(0xFFF2F6FA, 1.0f));
+    g_d2d_ctx->FillEllipse(
+        D2D1::Ellipse(D2D1::Point2F(kx, t.y + t.h * 0.5f), 6.0f, 6.0f), g_brush);
+    if (g_fmt_r) {
+        wchar_t buf[32];
+        _snwprintf_s(buf, 32, _TRUNCATE, L"%d%s", value, unit);
+        D2D1_RECT_F vr = D2D1::RectF(t.x - 56.0f, row.y + 3.0f,
+                                     t.x - 8.0f, row.y + row.h - 3.0f);
+        text_in(buf, vr, 0xFF9AA4AE, g_fmt_r);
+    }
+}
+
+static void aim_toggle_draw(AIM_RECT row, const wchar_t* label, float t) {
+    if (g_fmt_l) {
+        D2D1_RECT_F lr = D2D1::RectF(row.x, row.y + 3.0f,
+                                     row.x + 160.0f, row.y + row.h - 3.0f);
+        text_in(label, lr, 0xFFC8D0D8, g_fmt_l);
+    }
+    const float pw = 46.0f, ph = 20.0f;
+    const float px = row.x + row.w - pw;
+    const float py = row.y + (row.h - ph) * 0.5f;
+    const float r = (0x33 + (0x39 - 0x33) * t) / 255.0f;
+    const float g = (0x3A + (0xD6 - 0x3A) * t) / 255.0f;
+    const float b = (0x42 + (0x7F - 0x42) * t) / 255.0f;
+    D2D1_COLOR_F tc; tc.r=r; tc.g=g; tc.b=b; tc.a=1.0f;
+    g_brush->SetColor(tc);
+    g_d2d_ctx->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(px, py, px+pw, py+ph), ph*0.5f, ph*0.5f), g_brush);
+    const float kd = ph - 6.0f;
+    const float kx = px + 3.0f + t * (pw - kd - 6.0f);
+    g_brush->SetColor(col(0xFFF2F6FA, 1.0f));
+    g_d2d_ctx->FillEllipse(
+        D2D1::Ellipse(D2D1::Point2F(kx + kd*0.5f, py + ph*0.5f), kd*0.5f, kd*0.5f), g_brush);
+}
+
+static void aim_tick(float W, float H) {
+    const AIM_RECT s = aim_panel(W, H);
+    float mx = 0.0f, my = 0.0f;
+    const int have = ign_cursor(&mx, &my);
+    const int down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const int edge = down && !g_aim_lmb;
+    g_aim_lmb = down;
+
+    if (have) {
+        /* rows: 0 enable, 1 bone, 2 fov, 3 smooth, 4 nospread */
+        if (edge) {
+            const AIM_RECT r0 = aim_row(s, 0);
+            const AIM_RECT r1 = aim_row(s, 1);
+            const AIM_RECT r4 = aim_row(s, 4);
+            if (aim_hit(r0, mx, my)) { g_cfg.aim = !g_cfg.aim; cfg_apply(); cfg_save(); }
+            else if (aim_hit(r4, mx, my)) { g_cfg.nospread = !g_cfg.nospread; cfg_apply(); cfg_save(); }
+            else if (aim_hit(r1, mx, my)) {
+                /* left half cycles back, right half forward */
+                const int dir = (mx < r1.x + r1.w * 0.5f) ? -1 : 1;
+                int b = g_cfg.aim_bone + dir;
+                if (b < 0) b = RR_AIM_GROUP_COUNT - 1;
+                if (b >= RR_AIM_GROUP_COUNT) b = 0;
+                g_cfg.aim_bone = b; cfg_apply(); cfg_save();
+            }
+            else {
+                for (int k = 0; k < 2; ++k) {
+                    const AIM_RECT t = aim_track(aim_row(s, 2 + k));
+                    AIM_RECT grab = t;
+                    grab.y -= 10.0f; grab.h += 20.0f;
+                    grab.x -= 8.0f; grab.w += 16.0f;
+                    if (aim_hit(grab, mx, my)) { g_aim_drag = k; break; }
+                }
+            }
+        }
+        if (g_aim_drag >= 0 && down) {
+            const AIM_RECT t = aim_track(aim_row(s, 2 + g_aim_drag));
+            float f = (mx - t.x) / t.w;
+            if (f < 0.0f) f = 0.0f;
+            if (f > 1.0f) f = 1.0f;
+            if (g_aim_drag == 0) g_cfg.aim_fov = 1 + (int)(f * 179.0f);
+            else                 g_cfg.aim_smooth = 1 + (int)(f * 99.0f);
+            cfg_apply();
+        }
+        if (!down && g_aim_drag >= 0) { g_aim_drag = -1; cfg_save(); }
+    } else if (!down) {
+        g_aim_drag = -1;
+    }
+
+    const DWORD now = GetTickCount();
+    float dt = g_aim_last ? (float)(now - g_aim_last) : 16.0f;
+    g_aim_last = now;
+    if (dt > 100.0f) dt = 100.0f;
+    const float step = dt / 120.0f;
+    const int want[2] = { g_cfg.aim, g_cfg.nospread };
+    for (int k = 0; k < 2; ++k) {
+        const float w = want[k] ? 1.0f : 0.0f;
+        if (g_aim_anim[k] < w) { g_aim_anim[k] += step; if (g_aim_anim[k] > w) g_aim_anim[k] = w; }
+        else if (g_aim_anim[k] > w) { g_aim_anim[k] -= step; if (g_aim_anim[k] < w) g_aim_anim[k] = w; }
+    }
+}
+
+static void aim_draw(float W, float H) {
+    if (!g_d2d_ctx || !g_brush) return;
+    const AIM_RECT s = aim_panel(W, H);
+    D2D1_RECT_F bg = D2D1::RectF(s.x, s.y, s.x + s.w, s.y + s.h);
+    g_brush->SetColor(col(0xE6101418, 1.0f));
+    g_d2d_ctx->FillRectangle(bg, g_brush);
+    g_brush->SetColor(col(0xFF2A3138, 1.0f));
+    g_d2d_ctx->DrawRectangle(bg, g_brush, 1.0f);
+    if (g_fmt_l) {
+        D2D1_RECT_F hr = D2D1::RectF(s.x + 12.0f, s.y + 8.0f, s.x + s.w - 12.0f, s.y + 28.0f);
+        text_in(L"AIM", hr, 0xFF6FE3A8, g_fmt_l);
+    }
+    aim_toggle_draw(aim_row(s, 0), L"Enabled", g_aim_anim[0]);
+
+    /* bone selector */
+    {
+        const AIM_RECT r = aim_row(s, 1);
+        if (g_fmt_l) {
+            D2D1_RECT_F lr = D2D1::RectF(r.x, r.y + 3.0f, r.x + 120.0f, r.y + r.h - 3.0f);
+            text_in(L"Target bone", lr, 0xFFC8D0D8, g_fmt_l);
+        }
+        int b = g_cfg.aim_bone;
+        if (b < 0 || b >= RR_AIM_GROUP_COUNT) b = 0;
+        if (g_fmt_r) {
+            D2D1_RECT_F vr = D2D1::RectF(r.x + 120.0f, r.y + 3.0f, r.x + r.w, r.y + r.h - 3.0f);
+            wchar_t buf[64];
+            _snwprintf_s(buf, 64, _TRUNCATE, L"<  %s  >", bone_name[b]);
+            text_in(buf, vr, 0xFF6FE3A8, g_fmt_r);
+        }
+    }
+
+    aim_slider_draw(aim_row(s, 2), (float)(g_cfg.aim_fov - 1) / 179.0f,
+                    0x39D67F, L"FOV", g_cfg.aim_fov, L"\u00B0");
+    aim_slider_draw(aim_row(s, 3), (float)(g_cfg.aim_smooth - 1) / 99.0f,
+                    0x39D67F, L"Smoothing", g_cfg.aim_smooth, L"%");
+    aim_toggle_draw(aim_row(s, 4), L"No spread", g_aim_anim[1]);
+
+    if (g_fmt_l) {
+        D2D1_RECT_F fr = D2D1::RectF(s.x + 12.0f, s.y + s.h - 24.0f,
+                                     s.x + s.w - 12.0f, s.y + s.h - 6.0f);
+        text_in(L"Sensitivity is measured automatically", fr, 0xFF5A646E, g_fmt_l);
+    }
+}
+
 static void draw_frame(IDXGISwapChain* swap) {
     static RR_PLAYER players[RR_MAX_PLAYERS];
     static int why_logged = 0;
@@ -2078,38 +2288,32 @@ static void draw_frame(IDXGISwapChain* swap) {
      * working D2D target on this swapchain, and it stays visible on menus and
      * loading screens where there is nothing else to draw. */
     {
-        wchar_t mark[96];
-        _snwprintf_s(mark, 96, _TRUNCATE, L"rr_int %ld  seen %d  F1 menu",
-                     (long)g_frames, shown);
-        draw_text(mark, 92.0f, 4.0f, 184.0f, 0xFF39FF88);
     }
 
     /* Aim and anti-aim run on the frame thread with the snapshot this frame
      * already owns: no second reader, no lock, and the camera and size are the
      * ones the projection used. Either feature alone needs the call - aim
      * gating would also silence the anti-aim, which lives in the same worker. */
-    if ((g_cfg.aim || g_cfg.aa || g_cfg.trigger || g_cfg.norecoil ||
-         g_cfg.nospread || g_cfg.rage) && cam.valid && n > 0) {
+    if ((g_cfg.aim || g_cfg.trigger || g_cfg.nospread || g_cfg.rage) && cam.valid && n > 0) {
         rr_aim_update(players, n, &cam, (int)W, (int)H);
         /* Instant-lock diagnostics, throttled: what the loop picked, how far off
          * it was, what it asked SendInput for and what it has learned about this
          * game's sensitivity and axis directions. Six lines a second while the
          * aim key is held is enough to reconstruct a divergence. */
+                /* Magnet telemetry, throttled: what it locked, the remaining angle,
+         * what it asked SendInput for, and the sensitivity it has measured. */
         static unsigned aim_log_at;
         RR_AIM_FRAME af;
         rr_aim_frame_stats(&af);
         const unsigned now_frame = (unsigned)g_frames;
         if (af.picked && (now_frame - aim_log_at) >= 10) {
             aim_log_at = now_frame;
-            ilog("aim: id=%d pt=%.2f,%.2f,%.2f body=%.2f,%.2f,%.2f err=%.1f,%.1f "
-                 "sent=%d,%d px=%.3f,%.3f sign=%d,%d fov=%.1f",
-                 (int)af.id, af.point.x, af.point.y, af.point.z,
-                 af.body.x, af.body.y, af.body.z, af.err_x, af.err_y,
-                 af.sent_x, af.sent_y, af.px_x, af.px_y,
-                 af.sign_x, af.sign_y, af.fov);
+            ilog("aim: id=%d bone=%d yaw=%.3f pitch=%.3f sent=%d,%d dpc=%.5f fov=%.1f",
+                 (int)af.id, af.bone,
+                 (double)af.yaw, (double)af.pitch,
+                 af.sent_x, af.sent_y,
+                 (double)af.dpc, (double)af.fov);
         }
-        /* Nospread proof for the log: a changed count means a carrier was
-         * actually zeroed on that frame; a steady closed cone stays silent. */
         static int nospread_last = -1;
         const int nsw = rr_nospread_writes();
         if (nsw != nospread_last) {
@@ -2121,7 +2325,11 @@ static void draw_frame(IDXGISwapChain* swap) {
     }
 
     if (!cam.valid) {
-        if (g_menu_open) { draw_menu(W, H, shown); ign_tick(W, H); ign_draw(W, H); }
+        if (g_menu_open) {
+            draw_menu(W, H, shown);
+            ign_tick(W, H); ign_draw(W, H);
+            aim_tick(W, H); aim_draw(W, H);
+        }
         g_d2d_ctx->EndDraw();
         return;
     }
@@ -2249,6 +2457,8 @@ static void draw_frame(IDXGISwapChain* swap) {
         draw_menu(W, H, shown);
         ign_tick(W, H);
         ign_draw(W, H);
+        aim_tick(W, H);
+        aim_draw(W, H);
     }
 
     g_d2d_ctx->EndDraw();
@@ -2623,6 +2833,7 @@ static void maint_tick(void) {
 
     now = GetTickCount();
     rr_gate_set_open(g_menu_open);
+    rr_gate_pump();
     if (now - g_last_key_poll >= 20) {
         int key;
         g_last_key_poll = now;
