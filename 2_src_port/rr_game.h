@@ -111,6 +111,7 @@ typedef struct RR_PLAYER {
     int      is_npc;
     int      armor;                /* -1 unknown, 0 none, 1 has armour       */
     int      crouch;               /* -1 unknown, 0 standing, 1 crouched     */
+    int      prone; 
     char     role[20];             /* PlayerRoleDescription.Name            */
     char     weapon[20];           /* WeaponDescription.Name (dp9_m1, ...)   */
     char     name[RR_NAME_MAX];
@@ -318,7 +319,7 @@ uint64_t game_lens_debug(void);
 #ifdef __cplusplus
 }
 #endif
-
+void rr_player_prone(RR_PLAYER* players, int count);
 #endif /* RR_GAME_H */
 
 

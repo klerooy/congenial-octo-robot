@@ -67,7 +67,8 @@ RR_AIM_PICK rr_aim_pick(const RR_PLAYER* players, int count, const RR_CAMERA* ca
    POD: zero-initialize with {0} or memset; no other setup needed. */
 typedef struct {
     float carry_x, carry_y;
-    unsigned char inside_x, inside_y;   /* 1 while error is inside the deadzone */
+    unsigned char inside_x, inside_y;
+    float pend_x, pend_y;   /* mouse counts still in flight, per axis */
 } RR_AIM_STEER;
 
 typedef struct {

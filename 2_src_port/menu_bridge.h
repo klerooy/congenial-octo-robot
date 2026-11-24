@@ -100,7 +100,11 @@ extern "C" {
     X(show_health, 0, 0, 1) \
     X(show_vehicle_markers, 0, 0, 1) \
     X(show_vehicle_occupants, 0, 0, 1) \
-    X(show_vehicle_owner, 1, 0, 1)
+    X(show_vehicle_owner, 1, 0, 1) \
+    X(aim_ignore_dead, 1, 0, 1) \
+    X(aim_ignore_prone, 0, 0, 1) \
+    X(aim_ignore_party, 1, 0, 1) \
+    X(aim_ignore_clan, 1, 0, 1)
 
 typedef struct BR_Config {
     unsigned int magic, version;

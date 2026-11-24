@@ -6530,6 +6530,26 @@ static int frame_clock_changed(const FRAME_CLOCK* a, const FRAME_CLOCK* b) {
            a->server != b->server || a->simulated != b->simulated || a->player != b->player;
 }
 
+/* Prone from geometry. A standing rig puts the head ~1.7 m above the feet,
+ * crouch ~1.2 m, a body on the ground under 0.7 m. The lower bound rejects an
+ * unresolved rig where both points collapsed to the same value. Runs after the
+ * snapshot so it sees the final published feet/head, and it never overwrites a
+ * value the reader already resolved. */
+void rr_player_prone(RR_PLAYER* players, int count) {
+    if (!players || count <= 0) return;
+    if (count > RR_MAX_PLAYERS) count = RR_MAX_PLAYERS;
+    for (int i = 0; i < count; ++i) {
+        RR_PLAYER* p = &players[i];
+        if (p->prone >= 0) continue;
+        if (p->is_vehicle || p->is_loot) { p->prone = 0; continue; }
+        if (p->crouch == 2) { p->prone = 1; continue; }
+        if (!isfinite(p->head.y) || !isfinite(p->pos.y)) { p->prone = -1; continue; }
+        const float span = p->head.y - p->pos.y;
+        if (span <= 0.05f) { p->prone = -1; continue; }
+        p->prone = (span < 0.70f) ? 1 : 0;
+    }
+}
+
 int game_snapshot(RR_PLAYER* out, int max, RR_CAMERA* cam) {
     static FRAME_CLOCK previous;
     FRAME_CLOCK before, after;
@@ -6549,6 +6569,9 @@ int game_snapshot(RR_PLAYER* out, int max, RR_CAMERA* cam) {
         InterlockedExchange(&g_tick_period, 0);
     }
     g_pose_clock_changed = 0;
+    /* Derived stance, after the pose is final. Kept out of snapshot_read so the
+     * retry path cannot leave half the roster with a stale value. */
+    rr_player_prone(out, count);
     return count;
 }
 

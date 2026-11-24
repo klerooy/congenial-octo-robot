@@ -42,6 +42,14 @@ static int aim_alive(const RR_PLAYER* p) {
     return !p->dead && p->health != 0;
 }
 
+static int aim_target_allowed(const RR_PLAYER* p, const BR_Config* c) {
+    if (c->aim_ignore_dead  && !aim_alive(p))                     return 0;
+    if (c->aim_ignore_prone && p->prone == 1)                     return 0;
+    if (c->aim_ignore_party && (p->relationships & RR_REL_PARTY)) return 0;
+    if (c->aim_ignore_clan  && (p->relationships & RR_REL_CLAN))  return 0;
+    return 1;
+}
+
 /* Carriers zeroed by the last nospread pass, for the host log: zero means the
  * cone was already shut or the chain did not resolve, non-zero is the write
  * count. */
@@ -107,8 +115,9 @@ RR_AIM_PICK rr_aim_pick(const RR_PLAYER* players, int count, const RR_CAMERA* ca
         const RR_PLAYER* p = &players[i];
         /* Cheapest discriminators first: identity, then flags, then floats. */
         if (locked_addr && (p->addr != locked_addr || p->id != locked_id)) continue;
-        if (!p->addr || !p->valid || p->local || !aim_alive(p) ||
+                if (!p->addr || !p->valid || p->local ||
             p->is_vehicle || p->is_loot || p->hidden_in_object) continue;
+        if (!aim_target_allowed(p, config)) continue;
         if (!rr_relationship_allowed(p->relationships, want_clan, want_police, want_party))
             continue;
         if (!isfinite(p->dist) || (max_dist > 0.0f && p->dist > max_dist)) continue;
@@ -184,25 +193,23 @@ int rr_aim_motion_point(RR_V3 point, RR_V3 position, RR_V3 previous,
 /* One axis of bounded steering. Hysteresis: enter the deadzone below 0.35
  * reference-scaled units, leave it only above 0.50, so sensor noise at the
  * boundary cannot chatter the output between 0 and 1 count. */
-static int aim_axis(float error, float gain, float limit, float flick_cap,
-                    float* carry, unsigned char* inside) {
-    const float dz = *inside ? 0.50f : 0.35f;
-    if (fabsf(error) < dz) {
+static int aim_axis(float error_counts, float gain, float limit_counts,
+                    float* carry, unsigned char* inside, float* pend) {
+    const float want = error_counts - *pend * 0.6f;
+    const float dz = *inside ? 1.60f : 1.00f;
+    *pend *= 0.6f;
+    if (fabsf(want) < dz) {
         *carry = 0.0f;
         *inside = 1;
         return 0;
     }
     *inside = 0;
-    if (error * *carry < 0.0f) *carry = 0.0f;
-    /* A large correction must not be rate-limited by the smoothing limit, or
-     * the first frames after a flick stay behind a fast target. The flick cap
-     * is scaled by calibration so it bounds the same angular jump at any
-     * sensitivity. */
-    const float need = fabsf(error) * 0.5f;
-    if (need > limit) limit = need < flick_cap ? need : flick_cap;
-    const float step = fmaxf(-limit, fminf(limit, error * gain + *carry));
+    if (want * *carry < 0.0f) *carry = 0.0f;
+    const float step = fmaxf(-limit_counts,
+                             fminf(limit_counts, want * gain + *carry));
     const int counts = (int)step;
-    *carry = step - counts;
+    *carry = step - (float)counts;
+    *pend += (float)counts;
     return counts;
 }
 
@@ -216,28 +223,29 @@ void rr_aim_step(RR_AIM_STEER* state, float dx, float dy, float fov, int height,
         return;
     }
 
-    /* Project to the equivalent error at 1080p / 60 degrees, then apply the
-     * sensitivity calibration. Both factors are required: dropping either
-     * makes the correction depend on resolution or zoom. Verified: identical
-     * count sequences for equal angular errors across resolutions/FOVs. */
+    /* Pixels -> counts at this resolution and FOV, then sensitivity. Both
+     * factors are required or the correction depends on zoom and resolution. */
     const float projection = (1080.0f / height) *
                              (tanf(fov * RR_AIM_PI / 360.0f) / RR_TAN30);
     const float calib = (cal > 0 ? (float)cal : 100.0f) / 100.0f;
     const float scale = projection * calib;
 
-    /* Per-step limits represent similar angular corrections at any sens. */
-    const float limit = fmaxf(8.0f, 32.0f * calib);
-    const float flick_cap = 160.0f * calib;
+    /* Fixed angular budget per frame, scaled by calibration and elapsed time
+     * so a stalled frame is not given a smaller budget than a normal one. */
+    const float dt_scale = (float)(elapsed_ms ? elapsed_ms : 16u) / 16.0f;
+    const float limit = 16.0f * calib * fminf(dt_scale, 3.0f);
 
     const float response = aim_response_ms(smooth);
     const float gain = aim_gain(response, elapsed_ms);
+    /* Vertical slower while firing so recoil control and the aim loop do not
+     * fight over the same axis. */
     const float vertical_gain = (firing && response > 0.0f)
-        ? aim_gain(response * 0.8f, elapsed_ms) : gain;
+        ? aim_gain(response * 1.25f, elapsed_ms) : gain;
 
-    *mx = aim_axis(dx * scale, gain, limit, flick_cap,
-                   &state->carry_x, &state->inside_x);
-    *my = aim_axis(dy * scale, vertical_gain, limit, flick_cap,
-                   &state->carry_y, &state->inside_y);
+    *mx = aim_axis(dx * scale, gain, limit,
+                   &state->carry_x, &state->inside_x, &state->pend_x);
+    *my = aim_axis(dy * scale, vertical_gain, limit,
+                   &state->carry_y, &state->inside_y, &state->pend_y);
 }
 
 int rr_aim_bone_in_group(int group, int bone) {
@@ -504,11 +512,12 @@ RR_AIM_PICK rr_trigger_pick(const RR_PLAYER* players, int count, const RR_CAMERA
 
     for (int i = 0; i < count; ++i) {
         const RR_PLAYER* p = &players[i];
-        if (!p->addr || !p->valid || p->local || !aim_alive(p) || p->hidden_in_object ||
+        if (!p->addr || !p->valid || p->local || p->hidden_in_object ||
             p->is_vehicle || p->is_loot ||
             !isfinite(p->dist) || (max_dist > 0.0f && p->dist > max_dist) ||
             !rr_relationship_allowed(p->relationships, want_clan, want_police, want_party))
             continue;
+        if (!aim_target_allowed(p, config)) continue;
         for (int group = RR_AIM_HEAD; group <= last_group; ++group) {
             RR_V3 point;
             float sx, sy;

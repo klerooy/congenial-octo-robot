@@ -50,6 +50,7 @@
 #include "rr_antiaim.h"
 #include "rr_esp_style.h"
 #include "menu_bridge.h"
+#include "rr_input_gate.h"
 
 #define RR_INT_LOG   "C:\\Users\\Public\\rr_int.log"
 #define RR_INT_INI   "C:\\Users\\Public\\rr_int.ini"
@@ -122,6 +123,7 @@ typedef struct {
     /* Auto-loot: the vacuum write runs on a timer, and the interact key is held
      * while a container or a body is in reach so the game opens it itself. */
     int autoloot, autoloot_range, autoloot_key;
+    int ign_dead, ign_prone, ign_party, ign_clan;
 } INT_CFG;
 
 static INT_CFG g_cfg = {
@@ -138,7 +140,8 @@ static INT_CFG g_cfg = {
     0, 0, 100,
     1, 120, 1,
     1, 1, 1, 0, 1, 1, 1,
-    1, 12, 0x45            /* 'E' - VK_E is not a windows.h constant */
+    1, 12, 0x45
+    , 1, 0, 1, 1            /* 'E' - VK_E is not a windows.h constant */
 };
 
 /* Owned by the render thread: it is the thread that polls the menu keys. */
@@ -180,6 +183,10 @@ static void cfg_apply(void) {
     BR_Config* br = br_get();
     br->enabled = g_cfg.esp ? 1 : 0;
     br->show_box = g_cfg.boxes ? 1 : 0;
+    br->aim_ignore_dead  = g_cfg.ign_dead  ? 1 : 0;
+    br->aim_ignore_prone = g_cfg.ign_prone ? 1 : 0;
+    br->aim_ignore_party = g_cfg.ign_party ? 1 : 0;
+    br->aim_ignore_clan  = g_cfg.ign_clan  ? 1 : 0;
     br->show_name = g_cfg.names ? 1 : 0;
     br->show_distance = g_cfg.distance ? 1 : 0;
     br->show_health = g_cfg.health ? 1 : 0;
@@ -1814,6 +1821,205 @@ static void hud_place_and_draw(const RR_PLAYER* players, int n, float W, float H
     g_hud_label_count = 0;
 }
 
+/* ---- target-filter panel -------------------------------------------------
+ * Four independent switches drawn as sliding toggles in their own strip under
+ * the main panel. Self-contained: its own geometry, its own hit test, its own
+ * mouse edge. Nothing in the row table or the big switches is touched, so the
+ * existing keyboard navigation keeps working unchanged.
+ *
+ * A toggle is a pill with a knob that slides left (off) to right (on). Click
+ * anywhere on the pill flips it; the knob animates over ~120 ms so the state
+ * change reads as motion rather than a jump. */
+
+typedef struct { float x, y, w, h; } IGN_RECT;
+
+static float g_ign_anim[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+static int   g_ign_lmb = 0;
+static DWORD g_ign_last = 0;
+
+static const wchar_t* const ign_name[4] = {
+    L"Ignore dead", L"Ignore prone", L"Ignore party", L"Ignore clan"
+};
+
+static int ign_value(int k) {
+    switch (k) {
+    case 0: return g_cfg.ign_dead;
+    case 1: return g_cfg.ign_prone;
+    case 2: return g_cfg.ign_party;
+    case 3: return g_cfg.ign_clan;
+    default: return 0;
+    }
+}
+
+static void ign_set(int k, int v) {
+    switch (k) {
+    case 0: g_cfg.ign_dead  = v; break;
+    case 1: g_cfg.ign_prone = v; break;
+    case 2: g_cfg.ign_party = v; break;
+    case 3: g_cfg.ign_clan  = v; break;
+    default: break;
+    }
+}
+
+/* Strip geometry in surface pixels. Sits at the bottom-left, clear of the main
+ * panel and of the radar in the top-right. */
+static IGN_RECT ign_strip(float W, float H) {
+    IGN_RECT r;
+    r.w = 300.0f;
+    r.h = 132.0f;
+    r.x = 24.0f;
+    r.y = H - r.h - 24.0f;
+    if (r.y < 24.0f) r.y = 24.0f;
+    if (r.x + r.w > W - 24.0f) r.x = W - r.w - 24.0f;
+    if (r.x < 8.0f) r.x = 8.0f;
+    return r;
+}
+
+/* Pill rect for row k inside the strip. */
+static IGN_RECT ign_pill(IGN_RECT s, int k) {
+    IGN_RECT p;
+    p.w = 46.0f;
+    p.h = 20.0f;
+    p.x = s.x + s.w - p.w - 14.0f;
+    p.y = s.y + 34.0f + (float)k * 24.0f;
+    return p;
+}
+
+static int ign_cursor(float* mx, float* my) {
+    POINT pt;
+    RECT rc;
+    if (!g_game_hwnd || !IsWindow(g_game_hwnd)) return 0;
+    if (g_vw < 64.0f || g_vh < 64.0f) return 0;
+    if (!GetCursorPos(&pt)) return 0;
+    if (!GetClientRect(g_game_hwnd, &rc)) return 0;
+    if (!ScreenToClient(g_game_hwnd, &pt)) return 0;
+    const float cw = (float)(rc.right - rc.left);
+    const float ch = (float)(rc.bottom - rc.top);
+    if (cw < 1.0f || ch < 1.0f) return 0;
+    *mx = (float)pt.x * (g_vw / cw);
+    *my = (float)pt.y * (g_vh / ch);
+    return 1;
+}
+
+static int ign_hit(IGN_RECT r, float x, float y) {
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+}
+
+/* Input first, so a click lands on the state the painter will show this frame. */
+static void ign_tick(float W, float H) {
+    const IGN_RECT s = ign_strip(W, H);
+    float mx = 0.0f, my = 0.0f;
+    const int have = ign_cursor(&mx, &my);
+    const int down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const int edge = down && !g_ign_lmb;
+    g_ign_lmb = down;
+
+    if (edge && have) {
+        for (int k = 0; k < 4; ++k) {
+            /* Whole row is the click target, not just the pill: a 46x20 pill is
+             * a small thing to hit while the game is running. */
+            IGN_RECT row = s;
+            row.y = s.y + 30.0f + (float)k * 24.0f;
+            row.h = 24.0f;
+            if (ign_hit(row, mx, my)) {
+                ign_set(k, ign_value(k) ? 0 : 1);
+                cfg_apply();
+                cfg_save();
+                break;
+            }
+        }
+    }
+
+    /* Knob animation, time-based so it looks the same at any frame rate. */
+    const DWORD now = GetTickCount();
+    float dt = g_ign_last ? (float)(now - g_ign_last) : 16.0f;
+    g_ign_last = now;
+    if (dt > 100.0f) dt = 100.0f;
+    const float step = dt / 120.0f;
+    for (int k = 0; k < 4; ++k) {
+        const float want = ign_value(k) ? 1.0f : 0.0f;
+        if (g_ign_anim[k] < want) {
+            g_ign_anim[k] += step;
+            if (g_ign_anim[k] > want) g_ign_anim[k] = want;
+        } else if (g_ign_anim[k] > want) {
+            g_ign_anim[k] -= step;
+            if (g_ign_anim[k] < want) g_ign_anim[k] = want;
+        }
+    }
+}
+
+static void ign_draw(float W, float H) {
+    if (!g_d2d_ctx || !g_brush) return;
+    const IGN_RECT s = ign_strip(W, H);
+    float mx = 0.0f, my = 0.0f;
+    const int have = ign_cursor(&mx, &my);
+
+    /* Backdrop */
+    D2D1_RECT_F bg = D2D1::RectF(s.x, s.y, s.x + s.w, s.y + s.h);
+    g_brush->SetColor(col(0xE6101418, 1.0f));
+    g_d2d_ctx->FillRectangle(bg, g_brush);
+    g_brush->SetColor(col(0xFF2A3138, 1.0f));
+    g_d2d_ctx->DrawRectangle(bg, g_brush, 1.0f);
+
+    /* Header */
+    if (g_fmt_l) {
+        D2D1_RECT_F hr = D2D1::RectF(s.x + 14.0f, s.y + 8.0f,
+                                     s.x + s.w - 14.0f, s.y + 28.0f);
+        text_in(L"TARGET FILTERS", hr, 0xFF6FE3A8, g_fmt_l);
+    }
+
+    for (int k = 0; k < 4; ++k) {
+        const IGN_RECT p = ign_pill(s, k);
+        const float t = g_ign_anim[k];
+        IGN_RECT row = s;
+        row.y = s.y + 30.0f + (float)k * 24.0f;
+        row.h = 24.0f;
+        const int hot = have && ign_hit(row, mx, my);
+
+        /* Hover wash across the whole row */
+        if (hot) {
+            D2D1_RECT_F hb = D2D1::RectF(s.x + 6.0f, row.y,
+                                         s.x + s.w - 6.0f, row.y + row.h);
+            g_brush->SetColor(col(0x22FFFFFF, 1.0f));
+            g_d2d_ctx->FillRectangle(hb, g_brush);
+        }
+
+        /* Label */
+        if (g_fmt_l) {
+            D2D1_RECT_F lr = D2D1::RectF(s.x + 14.0f, row.y + 1.0f,
+                                         p.x - 10.0f, row.y + 21.0f);
+            text_in(ign_name[k], lr, hot ? 0xFFFFFFFF : 0xFFC8D0D8, g_fmt_l);
+        }
+
+        /* Track: grey when off, green when on, blended by the animation. */
+        const float r = (0x33 + (0x39 - 0x33) * t) / 255.0f;
+        const float g = (0x3A + (0xD6 - 0x3A) * t) / 255.0f;
+        const float b = (0x42 + (0x7F - 0x42) * t) / 255.0f;
+        D2D1_COLOR_F tc; tc.r = r; tc.g = g; tc.b = b; tc.a = 1.0f;
+        g_brush->SetColor(tc);
+        D2D1_ROUNDED_RECT track = D2D1::RoundedRect(
+            D2D1::RectF(p.x, p.y, p.x + p.w, p.y + p.h), p.h * 0.5f, p.h * 0.5f);
+        g_d2d_ctx->FillRoundedRectangle(track, g_brush);
+
+        /* Knob */
+        const float pad = 3.0f;
+        const float kd = p.h - pad * 2.0f;
+        const float kx = p.x + pad + t * (p.w - kd - pad * 2.0f);
+        g_brush->SetColor(col(0xFFF2F6FA, 1.0f));
+        g_d2d_ctx->FillEllipse(
+            D2D1::Ellipse(D2D1::Point2F(kx + kd * 0.5f, p.y + p.h * 0.5f),
+                          kd * 0.5f, kd * 0.5f), g_brush);
+
+        /* State word, right of nothing - sits inside the track's left/right */
+        if (g_fmt_r) {
+            D2D1_RECT_F sr = D2D1::RectF(p.x - 46.0f, row.y + 2.0f,
+                                         p.x - 6.0f, row.y + 20.0f);
+            text_in(ign_value(k) ? L"ON" : L"OFF", sr,
+                    ign_value(k) ? 0xFF6FE3A8 : 0xFF7A848E, g_fmt_r);
+        }
+    }
+}
+
 static void draw_frame(IDXGISwapChain* swap) {
     static RR_PLAYER players[RR_MAX_PLAYERS];
     static int why_logged = 0;
@@ -1859,6 +2065,8 @@ static void draw_frame(IDXGISwapChain* swap) {
         DXGI_SWAP_CHAIN_DESC sd;
         if (SUCCEEDED(swap->GetDesc(&sd))) g_game_hwnd = sd.OutputWindow;
     }
+
+    if (g_game_hwnd) rr_gate_install(g_game_hwnd);
 
     n = game_snapshot(players, RR_MAX_PLAYERS, &cam);
     InterlockedExchange(&g_players_seen, n);
@@ -1913,7 +2121,7 @@ static void draw_frame(IDXGISwapChain* swap) {
     }
 
     if (!cam.valid) {
-        if (g_menu_open) draw_menu(W, H, shown);
+        if (g_menu_open) { draw_menu(W, H, shown); ign_tick(W, H); ign_draw(W, H); }
         g_d2d_ctx->EndDraw();
         return;
     }
@@ -2037,7 +2245,11 @@ static void draw_frame(IDXGISwapChain* swap) {
 
     if (g_cfg.radar) draw_radar(players, n, &cam, W, H);
 
-    if (g_menu_open) draw_menu(W, H, shown);
+    if (g_menu_open) {
+        draw_menu(W, H, shown);
+        ign_tick(W, H);
+        ign_draw(W, H);
+    }
 
     g_d2d_ctx->EndDraw();
 }
@@ -2410,6 +2622,7 @@ static void maint_tick(void) {
     }
 
     now = GetTickCount();
+    rr_gate_set_open(g_menu_open);
     if (now - g_last_key_poll >= 20) {
         int key;
         g_last_key_poll = now;
@@ -2497,6 +2710,8 @@ extern "C" __declspec(dllexport) BOOL APIENTRY DllMain(HMODULE mod, DWORD reason
         raw_mark("dll: logged");
         init_once();
 
+    } else if (reason == DLL_PROCESS_DETACH) {
+        rr_gate_remove();
     }
     return TRUE;
 }

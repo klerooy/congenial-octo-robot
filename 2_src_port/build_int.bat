@@ -12,7 +12,7 @@ cd /d "%~dp0"
 
 set "VS="
 for %%P in (
-    "C:\Program Files\Microsoft Visual Studio\18\Community"
+    "C:\Program Files\Microsoft Visual Studio\18\Insiders"
     "C:\Program Files\Microsoft Visual Studio\18\Professional"
     "C:\Program Files\Microsoft Visual Studio\2022\Community"
     "C:\Program Files\Microsoft Visual Studio\2022\Professional"
@@ -41,6 +41,7 @@ cl %CFLAGS% /c rr_aim.c /Fo:int_aim.obj || goto fail
 cl %CFLAGS% /c rr_recoil.c /Fo:int_recoil.obj || goto fail
 cl %CFLAGS% /c rr_antiaim.c /Fo:int_antiaim.obj || goto fail
 cl %CFLAGS% /c rr_int_glue.c /Fo:int_glue.obj || goto fail
+cl %CFLAGS% /c rr_input_gate.c /Fo:int_gate.obj || goto fail
 
 echo [2/3] payload
 cl %CXXFLAGS% /c rr_int.cpp /Fo:int_payload.obj || goto fail
@@ -49,7 +50,7 @@ echo [3/3] link
 link /nologo /Brepro /DLL /MACHINE:X64 /OUT:rr_int.dll /IGNORE:4099 ^
   int_payload.obj int_game.obj int_mem.obj int_unity.obj int_chain.obj ^
   int_nodescan.obj int_classscan.obj int_find.obj int_cfg.obj ^
-  int_aim.obj int_recoil.obj int_antiaim.obj int_glue.obj ^
+  int_aim.obj int_recoil.obj int_antiaim.obj int_glue.obj int_gate.obj ^
   kernel32.lib user32.lib gdi32.lib advapi32.lib ole32.lib oleaut32.lib uuid.lib ^
   winmm.lib d3d11.lib dxgi.lib d2d1.lib dwrite.lib || goto fail
 
