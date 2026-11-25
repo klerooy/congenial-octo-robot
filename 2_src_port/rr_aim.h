@@ -1,3 +1,4 @@
+/* rr_aim.h - vector servo aim, trigger, nospread. */
 #ifndef RR_AIM_H
 #define RR_AIM_H
 #include "rr_game.h"
@@ -26,18 +27,34 @@ typedef struct {
     int tracked, fired;
 } RR_TRIGGER_STATE;
 
+/* Vector servo state. POD: zero-init then set dpc/sign fields, or call
+ * rr_magnet_reset. One 2-D direction and one magnitude per issued move. */
 typedef struct {
-    float carry_yaw, carry_pitch;
-    float pend_yaw, pend_pitch;   /* mouse counts still in flight */
-    float dpc;
+    float dpc;              /* degrees per mouse count, measured */
     int   dpc_valid;
-    float last_yaw, last_pitch;
-    int   sent_yaw, sent_pitch;
-    int   sign_yaw, sign_pitch;
-    int   have_last;
+    float carry_x, carry_y; /* fractional counts */
+
+    int   pending;          /* a move is in flight */
+    int   stable;           /* consecutive quiet frames */
+    int   timeout;          /* frames since the move was issued */
+    int   first_motion;     /* frame index of the first observed reply */
+    float base_yaw, base_pitch;
+    int   sent_x, sent_y;
+    float predicted;        /* degrees that move should consume */
+    float last_ang;         /* previous total angle, for the quiet detector */
+    int   have_last_ang;
+
+    float prev_tx, prev_ty, prev_tz;
+    int   have_prev_target;
+
+    int   latency;          /* measured input latency in frames */
+    int   latency_valid;
+
+    int   sign_x, sign_y;   /* +1 normal, -1 inverted axis */
 } RR_MAGNET;
 
 typedef struct {
+    /* current */
     int      picked;
     uint64_t addr;
     int32_t  id;
@@ -47,6 +64,11 @@ typedef struct {
     int      sent_x, sent_y;
     float    dpc;
     float    fov;
+    /* legacy members, kept so the host's existing log compiles unchanged */
+    RR_V3    body;
+    float    err_x, err_y;
+    float    px_x, px_y;
+    int      sign_x, sign_y;
 } RR_AIM_FRAME;
 
 void rr_aim_update(const RR_PLAYER* players, int count, const RR_CAMERA* camera,
@@ -73,11 +95,13 @@ RR_AIM_PICK rr_trigger_pick(const RR_PLAYER* players, int count, const RR_CAMERA
 int rr_trigger_ready(RR_TRIGGER_STATE* state, uint64_t addr, int32_t id,
                      unsigned now, int delay_ms);
 
+void rr_magnet_reset(RR_MAGNET* m);
 void rr_magnet_angles(const RR_CAMERA* cam, const RR_V3* point,
                       float* yaw_deg, float* pitch_deg);
-void rr_magnet_step(RR_MAGNET* m, float yaw, float pitch, int smooth,
-                    unsigned elapsed_ms, int* mx, int* my);
-void rr_magnet_feedback(RR_MAGNET* m, float yaw_now, float pitch_now);
+/* Returns the counts to send this frame, or 0/0 while waiting for the previous
+ * move to land. target is the world point, used to detect a moving target. */
+void rr_magnet_step(RR_MAGNET* m, float yaw, float pitch, RR_V3 target,
+                    int smooth, unsigned elapsed_ms, int* mx, int* my);
 
 #ifdef __cplusplus
 }

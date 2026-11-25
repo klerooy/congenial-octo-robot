@@ -656,13 +656,8 @@ static void text_in(const wchar_t* s, D2D1_RECT_F r, UINT32 argb, IDWriteTextFor
 }
 
 static const wchar_t* aa_label(int mode) {
-    switch (mode) {
-    case RR_ANTIAIM_SPIN:   return L"spin";
-    case RR_ANTIAIM_JITTER: return L"jitter";
-    case RR_ANTIAIM_STATIC: return L"static";
-    case RR_ANTIAIM_RANDOM: return L"random";
-    default:                return L"jitter";
-    }
+    (void)mode;
+    return L"removed";
 }
 
 static const wchar_t* recoil_label(int mode) {
@@ -2294,7 +2289,8 @@ static void draw_frame(IDXGISwapChain* swap) {
      * already owns: no second reader, no lock, and the camera and size are the
      * ones the projection used. Either feature alone needs the call - aim
      * gating would also silence the anti-aim, which lives in the same worker. */
-    if ((g_cfg.aim || g_cfg.trigger || g_cfg.nospread || g_cfg.rage) && cam.valid && n > 0) {
+    if ((g_cfg.aim || g_cfg.trigger || g_cfg.nospread || g_cfg.rage) &&
+        cam.valid && n > 0) {
         rr_aim_update(players, n, &cam, (int)W, (int)H);
         /* Instant-lock diagnostics, throttled: what the loop picked, how far off
          * it was, what it asked SendInput for and what it has learned about this
@@ -2302,6 +2298,9 @@ static void draw_frame(IDXGISwapChain* swap) {
          * aim key is held is enough to reconstruct a divergence. */
                 /* Magnet telemetry, throttled: what it locked, the remaining angle,
          * what it asked SendInput for, and the sensitivity it has measured. */
+                /* Magnet telemetry, throttled: the locked joint, the remaining angle,
+         * what SendInput was asked for, and the sensitivity measured at runtime.
+         * Six lines a second while the aim key is held. */
         static unsigned aim_log_at;
         RR_AIM_FRAME af;
         rr_aim_frame_stats(&af);

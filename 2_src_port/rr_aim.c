@@ -1,12 +1,25 @@
-/* rr_aim.c - angular magnet.
+/* rr_aim.c - vector servo aim.
  *
- * Works in degrees, not pixels. The camera basis gives the exact angle to a
- * joint; the only unknown is degrees-per-mouse-count, measured at runtime.
- * There is no calibration setting. FOV is a real cone half-angle.
+ * Why the previous version drifted sideways and into the floor: it estimated
+ * degrees-per-count from (angle_before - angle_after) / counts_sent every frame.
+ * On a moving target, and while an earlier move was still landing, that delta is
+ * not the reply to the move being measured. The estimate collapsed far below the
+ * truth, the loop then sent too many counts, and the next estimate collapsed
+ * further - a positive feedback path. At smooth 100 the gain is 1, so the error
+ * doubled every frame.
  *
- * Anti-jitter: every count sent is tracked as "in flight" and subtracted from
- * the next frame's error, so a move that has not landed yet is not corrected a
- * second time. That double-correction was the twitch above smooth 50.
+ * This version:
+ *   - measures sensitivity ONLY when the target is static in world space AND the
+ *     view has been quiet for several frames, so the measurement is unambiguous;
+ *   - keeps at most ONE move in flight while the target is static, so commands
+ *     cannot stack into an overshoot;
+ *   - clamps the proportional gain by the measured input latency, g <= 0.8*2/(L+1),
+ *     which is the stability margin of a delayed proportional loop. The slider
+ *     asks for speed up to that limit, never past it.
+ *
+ * Everything is one 2-D vector: direction is preserved by scaling both axes with
+ * the same factor, so the crosshair travels along the line to the joint instead
+ * of stair-stepping independently in yaw and pitch.
  */
 #include "rr_aim.h"
 #include "rr_cham_anchors.h"
@@ -25,16 +38,17 @@
 #define RR_AIM_NOW() GetTickCount64()
 #endif
 
-#define RR_DPC_SEED     0.050f   /* degrees per mouse count, first guess */
+#define RR_DPC_SEED     0.050f
 #define RR_DPC_MIN      0.002f
 #define RR_DPC_MAX      0.600f
-#define RR_DPC_MIN_SENT 4        /* smaller moves say nothing about the gain */
-#define RR_DPC_BLEND    0.10f    /* slow adaptation after the first sample */
-#define RR_PEND_DECAY   0.70f    /* fraction of in-flight counts kept */
-#define RR_STEP_DEG_MAX 9.0f     /* angular budget per 16 ms frame */
+#define RR_LAT_DEFAULT  4        /* conservative until measured */
+#define RR_LAT_MAX      8
+#define RR_QUIET_NEED   4        /* quiet frames that mean "landed" */
+#define RR_WAIT_MAX     26       /* hard ceiling on the wait */
+#define RR_QUIET_EPS    0.005f   /* degrees: below this the view is still */
+#define RR_MOVE_EPS     0.02f    /* metres: below this the target is static */
+#define RR_GAIN_BUDGET  9.0f     /* degrees of command in flight, total */
 #define RR_DT_MAX       50u
-#define RR_DEAD_DEG     0.020f
-#define RR_SMOOTH_MAX   95       /* 100 means one-frame snap: unstable with lag */
 
 static volatile LONG g_active;
 static RR_MAGNET     g_mag;
@@ -86,109 +100,175 @@ void rr_magnet_angles(const RR_CAMERA* cam, const RR_V3* point,
     if (isfinite(pitch)) *pitch_deg = pitch;
 }
 
-/* ------------------------------------------------------------------ magnet */
+/* -------------------------------------------------------------------- servo */
 
-static float magnet_gain(int smooth, unsigned elapsed_ms) {
-    if (smooth > RR_SMOOTH_MAX) smooth = RR_SMOOTH_MAX;
-    float a = (float)smooth / 100.0f;
-    if (!(a > 0.0f)) a = 0.02f;
-    if (a > 1.0f) a = 1.0f;
-    float dt = (float)(elapsed_ms ? elapsed_ms : 16u);
-    if (dt > (float)RR_DT_MAX) dt = (float)RR_DT_MAX;
-    return 1.0f - powf(1.0f - a, dt / 16.0f);
+void rr_magnet_reset(RR_MAGNET* m) {
+    if (!m) return;
+    memset(m, 0, sizeof(*m));
+    m->dpc = RR_DPC_SEED;
+    m->latency = RR_LAT_DEFAULT;
+    m->sign_x = 1;
+    m->sign_y = 1;
 }
 
-void rr_magnet_step(RR_MAGNET* m, float yaw, float pitch, int smooth,
-                    unsigned elapsed_ms, int* mx, int* my) {
+void rr_magnet_step(RR_MAGNET* m, float yaw, float pitch, RR_V3 target,
+                    int smooth, unsigned elapsed_ms, int* mx, int* my) {
     *mx = *my = 0;
     if (!m || !isfinite(yaw) || !isfinite(pitch)) return;
     if (!(m->dpc > RR_DPC_MIN) || !(m->dpc < RR_DPC_MAX) || !isfinite(m->dpc)) {
         m->dpc = RR_DPC_SEED;
         m->dpc_valid = 0;
     }
-    if (m->sign_yaw   != 1 && m->sign_yaw   != -1) m->sign_yaw   = 1;
-    if (m->sign_pitch != 1 && m->sign_pitch != -1) m->sign_pitch = 1;
+    if (m->sign_x != 1 && m->sign_x != -1) m->sign_x = 1;
+    if (m->sign_y != 1 && m->sign_y != -1) m->sign_y = 1;
+    if (m->latency < 1 || m->latency > RR_LAT_MAX) m->latency = RR_LAT_DEFAULT;
 
-    const float g = magnet_gain(smooth, elapsed_ms);
+    const float ang = sqrtf(yaw*yaw + pitch*pitch);
 
-    /* Subtract the input still in flight before deciding this frame's move. */
-    float wy = (yaw   - m->pend_yaw   * m->dpc * (float)m->sign_yaw)   * g;
-    float wp = (pitch - m->pend_pitch * m->dpc * (float)m->sign_pitch) * g;
-    m->pend_yaw   *= RR_PEND_DECAY;
-    m->pend_pitch *= RR_PEND_DECAY;
+    /* Is the target itself moving in world space? Only a static target gives an
+     * unambiguous sensitivity measurement. */
+    int still = 0;
+    if (m->have_prev_target) {
+        const float dx = target.x - m->prev_tx;
+        const float dy = target.y - m->prev_ty;
+        const float dz = target.z - m->prev_tz;
+        still = (dx*dx + dy*dy + dz*dz) < (RR_MOVE_EPS * RR_MOVE_EPS);
+    }
+    m->prev_tx = target.x; m->prev_ty = target.y; m->prev_tz = target.z;
+    m->have_prev_target = 1;
 
+    /* ---- wait for the outstanding move, then learn from it ---- */
+    if (m->pending) {
+        m->timeout++;
+        int moved = 0;
+        if (m->have_last_ang) {
+            const float d = fabsf(m->last_ang - ang);
+            moved = d >= RR_QUIET_EPS;
+            if (moved) {
+                if (!m->first_motion) {
+                    m->first_motion = m->timeout;
+                    /* Latency is only readable on a static target: otherwise the
+                     * angle changes because the target moved, not because our
+                     * command arrived. */
+                    if (still && !m->latency_valid) {
+                        int L = m->timeout;
+                        if (L < 1) L = 1;
+                        if (L > RR_LAT_MAX) L = RR_LAT_MAX;
+                        m->latency = L;
+                        m->latency_valid = 1;
+                    }
+                }
+                m->stable = 0;
+            } else {
+                m->stable++;
+            }
+        }
+        m->last_ang = ang;
+        m->have_last_ang = 1;
+
+        const int landed = (m->stable >= RR_QUIET_NEED) || (m->timeout >= RR_WAIT_MAX);
+        if (landed) {
+            const float dy = m->base_yaw   - yaw;
+            const float dp = m->base_pitch - pitch;
+            const float sent = sqrtf((float)(m->sent_x*m->sent_x +
+                                             m->sent_y*m->sent_y));
+            const float got = sqrtf(dy*dy + dp*dp);
+            /* Learn only from a clean pair: static target, big enough move,
+             * motion along the commanded direction, and at least 60% of the
+             * predicted angle actually consumed (otherwise we sampled early). */
+            if (sent >= 5.0f && still &&
+                (dy*(float)m->sent_x + dp*(float)m->sent_y) > 0.0f &&
+                got >= 0.6f * m->predicted) {
+                float meas = got / sent;
+                if (meas > RR_DPC_MIN && meas < RR_DPC_MAX) {
+                    if (!m->dpc_valid) {
+                        m->dpc = meas;
+                        m->dpc_valid = 1;
+                    } else {
+                        /* Rate limit: one update may not move the estimate more
+                         * than 1.6x up or 0.625x down. A single bad sample can
+                         * no longer collapse the gain. */
+                        if (meas < m->dpc * 0.625f) meas = m->dpc * 0.625f;
+                        if (meas > m->dpc * 1.600f) meas = m->dpc * 1.600f;
+                        m->dpc += 0.25f * (meas - m->dpc);
+                    }
+                }
+            } else if (sent >= 5.0f && still &&
+                       (dy*(float)m->sent_x + dp*(float)m->sent_y) < 0.0f &&
+                       got > 0.5f * m->predicted) {
+                /* The view went the opposite way twice as far as asked: the axis
+                 * is inverted, not mis-scaled. */
+                m->sign_x = -m->sign_x;
+                m->sign_y = -m->sign_y;
+                m->carry_x = m->carry_y = 0.0f;
+            }
+            m->pending = 0;
+            m->stable = 0;
+            m->timeout = 0;
+            m->first_motion = 0;
+        } else if (still) {
+            /* Static target: strictly one move at a time. */
+            return;
+        }
+    }
+
+    /* ---- issue the next vector move ---- */
+    float a = (float)smooth / 100.0f;
+    if (!(a > 0.0f)) a = 0.02f;
+    if (a > 1.0f) a = 1.0f;
     float dt = (float)(elapsed_ms ? elapsed_ms : 16u);
     if (dt > (float)RR_DT_MAX) dt = (float)RR_DT_MAX;
-    const float cap = RR_STEP_DEG_MAX * (dt / 16.0f);
-    if (wy >  cap) wy =  cap;
-    if (wy < -cap) wy = -cap;
-    if (wp >  cap) wp =  cap;
-    if (wp < -cap) wp = -cap;
+    float g = 1.0f - powf(1.0f - a, dt / 16.0f);
 
-    const float dz = fmaxf(RR_DEAD_DEG, m->dpc * 0.5f);
-    if (fabsf(wy) < dz) { wy = 0.0f; m->carry_yaw = 0.0f; }
-    if (fabsf(wp) < dz) { wp = 0.0f; m->carry_pitch = 0.0f; }
+    /* Stability margin of a proportional loop with L frames of delay. */
+    const float gmax = 0.8f * 2.0f / (float)(m->latency + 1);
+    if (g > gmax) g = gmax;
 
-    const float cy = wy / m->dpc * (float)m->sign_yaw   + m->carry_yaw;
-    const float cp = wp / m->dpc * (float)m->sign_pitch + m->carry_pitch;
+    float wy = yaw   * g;
+    float wp = pitch * g;
+
+    /* One angular budget shared by both axes: scaling both by the same factor
+     * keeps the direction, so the path is a straight line to the joint. */
+    const float cap = (RR_GAIN_BUDGET / (float)(m->latency + 1)) * (dt / 16.0f);
+    const float mag = sqrtf(wy*wy + wp*wp);
+    if (mag > cap && mag > 0.0f) {
+        const float k = cap / mag;
+        wy *= k; wp *= k;
+    }
+
+    const float dz = fmaxf(0.012f, m->dpc * 0.5f);
+    if (sqrtf(wy*wy + wp*wp) < dz) {
+        m->carry_x = m->carry_y = 0.0f;
+        return;
+    }
+
+    const float cx = wy / m->dpc * (float)m->sign_x + m->carry_x;
+    const float cy = wp / m->dpc * (float)m->sign_y + m->carry_y;
+    const int nx = (int)cx;
     const int ny = (int)cy;
-    const int np = (int)cp;
-    m->carry_yaw   = cy - (float)ny;
-    m->carry_pitch = cp - (float)np;
-    m->pend_yaw   += (float)ny;
-    m->pend_pitch += (float)np;
+    m->carry_x = cx - (float)nx;
+    m->carry_y = cy - (float)ny;
+    if (!nx && !ny) return;
 
-    m->last_yaw   = yaw;
-    m->last_pitch = pitch;
-    m->sent_yaw   = ny;
-    m->sent_pitch = np;
-    m->have_last  = 1;
-    *mx = ny;
-    *my = np;
-}
-
-void rr_magnet_feedback(RR_MAGNET* m, float yaw_now, float pitch_now) {
-    if (!m || !m->have_last) return;
-    if (!isfinite(yaw_now) || !isfinite(pitch_now)) { m->have_last = 0; return; }
-
-    const float dy = m->last_yaw   - yaw_now;
-    const float dp = m->last_pitch - pitch_now;
-
-    if (abs(m->sent_yaw) >= RR_DPC_MIN_SENT) {
-        const float eff = dy * (float)m->sent_yaw * (float)m->sign_yaw;
-        if (eff > 0.0f) {
-            const float meas = fabsf(dy) / (float)abs(m->sent_yaw);
-            if (meas > RR_DPC_MIN && meas < RR_DPC_MAX) {
-                if (!m->dpc_valid) { m->dpc = meas; m->dpc_valid = 1; }
-                else m->dpc += RR_DPC_BLEND * (meas - m->dpc);
-            }
-        } else if (eff < 0.0f && fabsf(dy) > fabsf(m->last_yaw) * 0.5f) {
-            m->sign_yaw = -m->sign_yaw;
-            m->carry_yaw = 0.0f;
-            m->pend_yaw = 0.0f;
-        }
+    if (!m->pending) {
+        m->base_yaw   = yaw;
+        m->base_pitch = pitch;
+        m->sent_x = nx;
+        m->sent_y = ny;
+        m->predicted = sqrtf((float)(nx*nx + ny*ny)) * m->dpc;
+        m->pending = 1;
+        m->last_ang = ang;
+        m->have_last_ang = 1;
+        m->stable = 0;
+        m->timeout = 0;
+        m->first_motion = 0;
     }
-    if (abs(m->sent_pitch) >= RR_DPC_MIN_SENT) {
-        const float eff = dp * (float)m->sent_pitch * (float)m->sign_pitch;
-        if (eff > 0.0f) {
-            const float meas = fabsf(dp) / (float)abs(m->sent_pitch);
-            if (meas > RR_DPC_MIN && meas < RR_DPC_MAX) {
-                if (!m->dpc_valid) { m->dpc = meas; m->dpc_valid = 1; }
-                else m->dpc += RR_DPC_BLEND * (meas - m->dpc);
-            }
-        } else if (eff < 0.0f && fabsf(dp) > fabsf(m->last_pitch) * 0.5f) {
-            m->sign_pitch = -m->sign_pitch;
-            m->carry_pitch = 0.0f;
-            m->pend_pitch = 0.0f;
-        }
-    }
-    m->have_last = 0;
+    *mx = nx;
+    *my = ny;
 }
 
 /* ------------------------------------------------------------- body points */
 
-/* Joint groups against the real 94-bone palette in rr_cham_types.h.
- * Attachment helpers (weapon, magazine, bags) belong to no group. */
 int rr_aim_bone_in_group(int group, int bone) {
     if (bone < 0 || bone >= RR_CHAM_BONES) return 0;
     switch (group) {
@@ -494,10 +574,7 @@ static void send_move(int dx, int dy) {
 }
 
 static void reset_worker(void) {
-    memset(&g_mag, 0, sizeof(g_mag));
-    g_mag.dpc = RR_DPC_SEED;
-    g_mag.sign_yaw = 1;
-    g_mag.sign_pitch = 1;
+    rr_magnet_reset(&g_mag);
     memset(&g_trig, 0, sizeof(g_trig));
     g_lock_addr = 0; g_lock_id = 0; g_lock_bone = -1; g_lock_at = 0;
     g_last_at = 0;
@@ -519,7 +596,7 @@ void rr_aim_update(const RR_PLAYER* players, int count, const RR_CAMERA* camera,
     if (config->rage) {
         rage = *config;
         rage.aim_enabled = 1;
-        rage.aim_smooth = 90;
+        rage.aim_smooth = 100;
         rage.aim_fov = 180;
         rage.aa_bone = RR_AIM_HEAD;
         rage.aa_dist = 0;
@@ -564,10 +641,16 @@ void rr_aim_update(const RR_PLAYER* players, int count, const RR_CAMERA* camera,
                                0, 0, -1, config->aa_los_on ? los_clear : NULL);
 
         if (pick.player) {
+            /* A new body invalidates the outstanding measurement, but the learned
+             * sensitivity and latency stay: they are properties of the game. */
             if (pick.player->addr != g_lock_addr || pick.player->id != g_lock_id) {
-                g_mag.have_last = 0;
-                g_mag.carry_yaw = g_mag.carry_pitch = 0.0f;
-                g_mag.pend_yaw = g_mag.pend_pitch = 0.0f;
+                g_mag.pending = 0;
+                g_mag.stable = 0;
+                g_mag.timeout = 0;
+                g_mag.first_motion = 0;
+                g_mag.have_last_ang = 0;
+                g_mag.have_prev_target = 0;
+                g_mag.carry_x = g_mag.carry_y = 0.0f;
             }
             g_lock_addr = pick.player->addr;
             g_lock_id   = pick.player->id;
@@ -576,34 +659,55 @@ void rr_aim_update(const RR_PLAYER* players, int count, const RR_CAMERA* camera,
 
             float yaw, pitch;
             rr_magnet_angles(camera, &pick.point, &yaw, &pitch);
-            rr_magnet_feedback(&g_mag, yaw, pitch);
 
             int mx, my;
-            rr_magnet_step(&g_mag, yaw, pitch, config->aim_smooth, elapsed, &mx, &my);
+            rr_magnet_step(&g_mag, yaw, pitch, pick.point,
+                           config->aim_smooth, elapsed, &mx, &my);
             if (mx || my) {
                 send_move(mx, my);
                 InterlockedExchange(&g_active, 1);
             }
-            g_frame.picked = 1;
-            g_frame.addr = pick.player->addr;
-            g_frame.id   = pick.player->id;
-            g_frame.bone = pick.bone;
-            g_frame.point = pick.point;
-            g_frame.yaw = yaw; g_frame.pitch = pitch;
-            g_frame.sent_x = mx; g_frame.sent_y = my;
-            g_frame.dpc = g_mag.dpc;
-            g_frame.fov = camera->fov;
+
+            g_frame.picked  = 1;
+            g_frame.addr    = pick.player->addr;
+            g_frame.id      = pick.player->id;
+            g_frame.bone    = pick.bone;
+            g_frame.point   = pick.point;
+            g_frame.yaw     = yaw;
+            g_frame.pitch   = pitch;
+            g_frame.sent_x  = mx;
+            g_frame.sent_y  = my;
+            g_frame.dpc     = g_mag.dpc;
+            g_frame.fov     = camera->fov;
+
+            /* Legacy members for the host's existing diagnostics block. */
+            g_frame.body    = pick.player->pos;
+            g_frame.err_x   = pick.dx;
+            g_frame.err_y   = pick.dy;
+            {
+                const float half = tanf(camera->fov * RR_PI / 360.0f);
+                const float px_per_deg = (half > 0.0001f)
+                    ? ((float)height * 0.5f / half) * (RR_PI / 180.0f)
+                    : 0.0f;
+                g_frame.px_x = g_mag.dpc * px_per_deg;
+                g_frame.px_y = g_mag.dpc * px_per_deg;
+            }
+            g_frame.sign_x  = g_mag.sign_x;
+            g_frame.sign_y  = g_mag.sign_y;
         } else {
             g_frame.picked = 0;
             g_lock_addr = 0; g_lock_id = 0; g_lock_bone = -1;
-            g_mag.have_last = 0;
-            g_mag.carry_yaw = g_mag.carry_pitch = 0.0f;
-            g_mag.pend_yaw = g_mag.pend_pitch = 0.0f;
+            g_mag.pending = 0;
+            g_mag.have_last_ang = 0;
+            g_mag.have_prev_target = 0;
+            g_mag.carry_x = g_mag.carry_y = 0.0f;
         }
     } else {
         g_frame.picked = 0;
         g_lock_addr = 0; g_lock_id = 0; g_lock_bone = -1;
-        g_mag.have_last = 0;
+        g_mag.pending = 0;
+        g_mag.have_last_ang = 0;
+        g_mag.have_prev_target = 0;
     }
 
     const int trig_held = config->trigger_key
