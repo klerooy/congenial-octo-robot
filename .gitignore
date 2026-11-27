@@ -7,4 +7,9 @@
 *.sys
 *.log
 *.ilk
+docs
+pasting
+offsets
+tests
+tools
 2_src_port/int_*.obj

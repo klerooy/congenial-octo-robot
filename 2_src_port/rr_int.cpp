@@ -11,7 +11,8 @@
  *   Present hook -> menu input -> snapshot -> aim tick -> draw -> original
  *
  * Interaction: F1 opens the in-process menu (rows: ESP, boxes, names, skeleton,
- * health, distance, range, aim, aim key, FOV, smoothing, bone, aim range,
+ * health, distance, range, aim, aim key, visible only, FOV, smoothing, bone,
+ * aim range, humanize, humanize strength/speed, random bones, bone interval,
  * trigger, trigger key, recoil, radar, radar range, radar loot, loot markers,
  * cash nodes, containers, doors, dropped loot, vehicle loot, prices, auto loot,
  * loot range, interact key). The menu is drawn by this module on the game's
@@ -20,7 +21,7 @@
  *
  * Configuration: C:\Users\Public\rr_int.ini, written on every menu change and
  * read once at load.
- *   esp=1 names=1 boxes=1 distance=1 health=1 skeleton=1 max_dist=30000
+ *   esp=1 names=1 boxes=1 distance=1 health=1 skeleton=1 max_dist=60000
  *   aim=1 aim_key=6 aim_fov=150 aim_smooth=30 aim_bone=2 aim_dist=150
  *   trigger=0 trigger_key=0 trigger_delay=80 norecoil=0
  *   radar=1 radar_range=120 radar_loot=1
@@ -47,6 +48,7 @@
 #include "rr_mem.h"
 #include "rr_game.h"
 #include "rr_aim.h"
+#include "rr_los.h"
 #include "rr_esp_style.h"
 #include "menu_bridge.h"
 #include "rr_input_gate.h"
@@ -97,7 +99,7 @@ static void ilog(const char* fmt, ...) {
  * where the last one stopped. Insert stays the master switch for the overlay. */
 typedef struct {
     int esp, names, boxes, distance, health, skeleton;
-    int fov_circle;    /* aim ring, read by rr_draw.c as aa_show_fov */
+    int fov_circle;    /* aim ring: drawn here and mapped to aa_show_fov */
     int insert_key, menu_key;
     int max_dist;      /* centimetres, as the overlay menu stores them */
     /* rage is a preset the aim worker applies to a copy of the shared settings:
@@ -105,7 +107,14 @@ typedef struct {
      * anti-aim off. The sliders below keep their values, so clearing rage gives
      * the old aim back on the same frame. */
     int rage;
-    int aim, aim_key, aim_fov, aim_smooth, aim_bone, aim_dist, aim_cal, aim_fire;
+    int aim, aim_key, aim_fov, aim_smooth, aim_bone, aim_dist, aim_fire;
+    /* Humanization and bone randomization. Both are opt-in; the strength and
+     * speed sliders keep their values while the switch is off. */
+    int aim_humanize, aim_humanize_strength, aim_humanize_speed;
+    int aim_bone_random, aim_bone_interval;
+    /* Only-visible switch for both aim and trigger. The LOS worker is linked
+     * into this payload and pumped from Present. */
+    int aim_los;
     /* Anti-aim: a bounded view perturbation, not a server-side desync. It rides
      * the same worker as the aim, is gated off while steering, firing or while
      * the menu is up, and a bound key turns it into a hold. */
@@ -123,17 +132,28 @@ typedef struct {
     /* Auto-loot: the vacuum write runs on a timer, and the interact key is held
      * while a container or a body is in reach so the game opens it itself. */
     int autoloot, autoloot_range, autoloot_key;
-    int ign_dead, ign_prone, ign_party, ign_clan;
+    int ign_dead, ign_prone, ign_party, ign_clan, ign_civilian;
+    /* Top-left of the panel in surface pixels; -1 keeps it centred. The panel
+     * is dragged by its title strip, so the position is a setting like any
+     * other and survives a restart. */
+    int menu_x, menu_y;
+    /* 1 = camera lock, 0 = mouse steering. Kept in the ini; the camera path
+     * falls back to mouse automatically when the hook is unavailable. */
+    int aim_mode;
+    /* Legit mode: reaction window on a new target, a bounded camera turn rate
+     * and line-of-sight acquisition. The rage preset bypasses it. */
+    int aim_legit;
 } INT_CFG;
 
 static INT_CFG g_cfg = {
     1, 1, 1, 1, 1, 1,
     1,
     VK_INSERT, VK_F1,
-    30000,
+    60000,
     0,
-    1, VK_XBUTTON2, 300, 100, RR_AIM_HEAD, 150, 100,
+    1, VK_XBUTTON2, 300, 100, RR_AIM_HEAD, 150,
     0,
+    0, 35, 50, 0, 350, 1,
     0, RR_ANTIAIM_JITTER, 60, 6, 0,
     0, 0, 80, 10, 0,
     1,
@@ -141,7 +161,10 @@ static INT_CFG g_cfg = {
     1, 120, 1,
     1, 1, 1, 0, 1, 1, 1,
     1, 12, 0x45
-    , 1, 0, 1, 1            /* 'E' - VK_E is not a windows.h constant */
+    , 1, 0, 1, 1, 0         /* 'E' - VK_E is not a windows.h constant */
+    , -1, -1                /* menu position: centred until dragged */
+    , 1                     /* camera lock on by default */
+    , 1                     /* legit mode on by default */
 };
 
 /* Owned by the render thread: it is the thread that polls the menu keys. */
@@ -151,12 +174,26 @@ static int g_menu_tab = 0;   /* TAB_AIM; the tab enum lives with the panel below
 static int g_menu_rebind = 0;
 static DWORD g_menu_rebind_at = 0;
 static int g_menu_hover = -1;
+static int g_menu_hover_tab = -1;
 static int g_menu_lmb = 0;
+static int g_menu_drag_row = -1;   /* number row being scrubbed by the mouse */
+static float g_menu_drag_x0 = 0.0f; /* press point, so a click does not jump */
+static int g_menu_drag_moved = 0;
+/* Whole-window drag: the title strip is the handle. The grab offset is where
+ * inside the window the press landed, so the panel does not jump to the
+ * pointer on the first frame. */
+static int   g_menu_win_drag = 0;
+static int   g_menu_win_moved = 0;
+static float g_menu_grab_x = 0.0f, g_menu_grab_y = 0.0f;
 /* Panel layout is shared by the painter and the pointer hit test; the window
  * handle and the last painted surface size are what map a cursor position into
  * the swapchain's pixel space. */
 static HWND  g_game_hwnd = NULL;
 static float g_vw = 0.0f, g_vh = 0.0f;
+/* The game clips the pointer while the match runs. The panel releases that
+ * clip so the OS cursor can reach its rows, and restores it on close. */
+static RECT  g_menu_clip;
+static int   g_menu_clip_saved = 0;
 
 static int ini_int(const char* text, const char* key, int fallback) {
     const char* p = text;
@@ -187,6 +224,18 @@ static void cfg_apply(void) {
     br->aim_ignore_prone = g_cfg.ign_prone ? 1 : 0;
     br->aim_ignore_party = g_cfg.ign_party ? 1 : 0;
     br->aim_ignore_clan  = g_cfg.ign_clan  ? 1 : 0;
+    br->aim_ignore_civilian = g_cfg.ign_civilian ? 1 : 0;
+    /* Mirror the clan/party switches into the shared relationship mask. The
+     * picker reads dead/prone from the flags above and uses this mask for the
+     * relationship bits; the external overlay and the legacy aa_target_* keys
+     * read the same two fields. */
+    {
+        int allowed = RR_REL_POLICE;
+        if (!g_cfg.ign_clan)  allowed |= RR_REL_CLAN;
+        if (!g_cfg.ign_party) allowed |= RR_REL_PARTY;
+        br->aim_targets = allowed;
+        br->trigger_targets = allowed;
+    }
     br->show_name = g_cfg.names ? 1 : 0;
     br->show_distance = g_cfg.distance ? 1 : 0;
     br->show_health = g_cfg.health ? 1 : 0;
@@ -200,9 +249,18 @@ static void cfg_apply(void) {
     br->aim_key = g_cfg.aim_key;
     br->aim_fov = g_cfg.aim_fov;
     br->aim_smooth = g_cfg.aim_smooth;
+    br->aim_legit = g_cfg.aim_legit ? 1 : 0;
     br->aa_bone = g_cfg.aim_bone;
     br->aa_dist = g_cfg.aim_dist;
-    br->aa_aim_cal = g_cfg.aim_cal;
+    br->aim_humanize = g_cfg.aim_humanize ? 1 : 0;
+    br->aim_humanize_strength = g_cfg.aim_humanize_strength;
+    br->aim_humanize_speed = g_cfg.aim_humanize_speed;
+    br->aim_bone_random = g_cfg.aim_bone_random ? 1 : 0;
+    br->aim_bone_interval = g_cfg.aim_bone_interval;
+    /* One visible-only switch on this menu drives both aim and trigger; the
+     * external menu keeps the two independent. */
+    br->aa_los_on = g_cfg.aim_los ? 1 : 0;
+    br->trigger_los = g_cfg.aim_los ? 1 : 0;
     br->aim_require_fire = g_cfg.aim_fire ? 1 : 0;
     br->antiaim_enabled = g_cfg.aa ? 1 : 0;
     br->antiaim_mode = g_cfg.aa_mode;
@@ -237,6 +295,7 @@ static void cfg_apply(void) {
         br->loot_tier_exotic = 1;
     /* The aim worker keeps its hands off while the menu is up. */
     br->menu_open = g_menu_open ? 1 : 0;
+    rr_aim_set_camera_mode(g_cfg.aim_mode);
 }
 
 static void cfg_save(void) {
@@ -247,10 +306,18 @@ static void cfg_save(void) {
     fprintf(f, "max_dist=%d\ninsert_key=%d\nmenu_key=%d\n",
             g_cfg.max_dist, g_cfg.insert_key, g_cfg.menu_key);
     fprintf(f, "fov_circle=%d\nrage=%d\n", g_cfg.fov_circle, g_cfg.rage);
+    fprintf(f, "ign_dead=%d\nign_prone=%d\nign_party=%d\nign_clan=%d\nign_civilian=%d\n",
+            g_cfg.ign_dead, g_cfg.ign_prone, g_cfg.ign_party, g_cfg.ign_clan,
+            g_cfg.ign_civilian);
     fprintf(f, "aim=%d\naim_key=%d\naim_fov=%d\naim_smooth=%d\naim_bone=%d\naim_dist=%d\n",
             g_cfg.aim, g_cfg.aim_key, g_cfg.aim_fov, g_cfg.aim_smooth,
             g_cfg.aim_bone, g_cfg.aim_dist);
-    fprintf(f, "aim_cal=%d\naim_fire=%d\n", g_cfg.aim_cal, g_cfg.aim_fire);
+    fprintf(f, "aim_fire=%d\naim_mode=%d\naim_legit=%d\n",
+            g_cfg.aim_fire, g_cfg.aim_mode, g_cfg.aim_legit);
+    fprintf(f, "aim_humanize=%d\naim_humanize_strength=%d\naim_humanize_speed=%d\n"
+               "aim_bone_random=%d\naim_bone_interval=%d\naim_los=%d\n",
+            g_cfg.aim_humanize, g_cfg.aim_humanize_strength, g_cfg.aim_humanize_speed,
+            g_cfg.aim_bone_random, g_cfg.aim_bone_interval, g_cfg.aim_los);
     fprintf(f, "aa=%d\naa_mode=%d\naa_speed=%d\naa_range=%d\naa_key=%d\n",
             g_cfg.aa, g_cfg.aa_mode, g_cfg.aa_speed, g_cfg.aa_range, g_cfg.aa_key);
     fprintf(f, "trigger=%d\ntrigger_key=%d\ntrigger_delay=%d\ntrigger_fov=%d\ntrigger_head=%d\n"
@@ -266,6 +333,7 @@ static void cfg_save(void) {
             g_cfg.dropped, g_cfg.vehicle_loot, g_cfg.prices);
     fprintf(f, "autoloot=%d\nautoloot_range=%d\nautoloot_key=%d\n",
             g_cfg.autoloot, g_cfg.autoloot_range, g_cfg.autoloot_key);
+    fprintf(f, "menu_x=%d\nmenu_y=%d\n", g_cfg.menu_x, g_cfg.menu_y);
     fclose(f);
 }
 
@@ -288,14 +356,29 @@ static void cfg_load(void) {
     g_cfg.menu_key = ini_int(buf, "menu_key", g_cfg.menu_key);
     g_cfg.fov_circle = ini_int(buf, "fov_circle", g_cfg.fov_circle);
     g_cfg.rage     = ini_int(buf, "rage", g_cfg.rage);
+    g_cfg.ign_dead = ini_int(buf, "ign_dead", g_cfg.ign_dead);
+    g_cfg.ign_prone = ini_int(buf, "ign_prone", g_cfg.ign_prone);
+    g_cfg.ign_party = ini_int(buf, "ign_party", g_cfg.ign_party);
+    g_cfg.ign_clan = ini_int(buf, "ign_clan", g_cfg.ign_clan);
+    g_cfg.ign_civilian = ini_int(buf, "ign_civilian", g_cfg.ign_civilian);
     g_cfg.aim      = ini_int(buf, "aim", g_cfg.aim);
     g_cfg.aim_key  = ini_int(buf, "aim_key", g_cfg.aim_key);
     g_cfg.aim_fov  = ini_int(buf, "aim_fov", g_cfg.aim_fov);
     g_cfg.aim_smooth = ini_int(buf, "aim_smooth", g_cfg.aim_smooth);
     g_cfg.aim_bone = ini_int(buf, "aim_bone", g_cfg.aim_bone);
     g_cfg.aim_dist = ini_int(buf, "aim_dist", g_cfg.aim_dist);
-    g_cfg.aim_cal  = ini_int(buf, "aim_cal", g_cfg.aim_cal);
     g_cfg.aim_fire = ini_int(buf, "aim_fire", g_cfg.aim_fire);
+    g_cfg.aim_mode = ini_int(buf, "aim_mode", g_cfg.aim_mode);
+    g_cfg.aim_legit = ini_int(buf, "aim_legit", g_cfg.aim_legit);
+    g_cfg.aim_humanize = ini_int(buf, "aim_humanize", g_cfg.aim_humanize);
+    g_cfg.aim_humanize_strength = ini_int(buf, "aim_humanize_strength",
+                                          g_cfg.aim_humanize_strength);
+    g_cfg.aim_humanize_speed = ini_int(buf, "aim_humanize_speed",
+                                       g_cfg.aim_humanize_speed);
+    g_cfg.aim_bone_random = ini_int(buf, "aim_bone_random", g_cfg.aim_bone_random);
+    g_cfg.aim_bone_interval = ini_int(buf, "aim_bone_interval",
+                                      g_cfg.aim_bone_interval);
+    g_cfg.aim_los = ini_int(buf, "aim_los", g_cfg.aim_los);
     g_cfg.aa       = ini_int(buf, "aa", g_cfg.aa);
     g_cfg.aa_mode  = ini_int(buf, "aa_mode", g_cfg.aa_mode);
     g_cfg.aa_speed = ini_int(buf, "aa_speed", g_cfg.aa_speed);
@@ -323,6 +406,8 @@ static void cfg_load(void) {
     g_cfg.autoloot = ini_int(buf, "autoloot", g_cfg.autoloot);
     g_cfg.autoloot_range = ini_int(buf, "autoloot_range", g_cfg.autoloot_range);
     g_cfg.autoloot_key = ini_int(buf, "autoloot_key", g_cfg.autoloot_key);
+    g_cfg.menu_x   = ini_int(buf, "menu_x", g_cfg.menu_x);
+    g_cfg.menu_y   = ini_int(buf, "menu_y", g_cfg.menu_y);
 
     if (g_cfg.max_dist < 1000) g_cfg.max_dist = 1000;
     if (g_cfg.max_dist > 200000) g_cfg.max_dist = 200000;
@@ -336,8 +421,17 @@ static void cfg_load(void) {
     if (g_cfg.aim_bone < 0 || g_cfg.aim_bone >= RR_AIM_GROUP_COUNT) g_cfg.aim_bone = RR_AIM_CHEST;
     if (g_cfg.aim_dist < 0) g_cfg.aim_dist = 0;
     if (g_cfg.aim_dist > 1000) g_cfg.aim_dist = 1000;
-    if (g_cfg.aim_cal < 10) g_cfg.aim_cal = 10;
-    if (g_cfg.aim_cal > 2000) g_cfg.aim_cal = 2000;
+    if (g_cfg.aim_mode < 0 || g_cfg.aim_mode > 1) g_cfg.aim_mode = 1;
+    if (g_cfg.aim_legit < 0 || g_cfg.aim_legit > 1) g_cfg.aim_legit = 1;
+    if (g_cfg.aim_humanize < 0 || g_cfg.aim_humanize > 1) g_cfg.aim_humanize = 0;
+    if (g_cfg.aim_humanize_strength < 0) g_cfg.aim_humanize_strength = 0;
+    if (g_cfg.aim_humanize_strength > 100) g_cfg.aim_humanize_strength = 100;
+    if (g_cfg.aim_humanize_speed < 1) g_cfg.aim_humanize_speed = 1;
+    if (g_cfg.aim_humanize_speed > 100) g_cfg.aim_humanize_speed = 100;
+    if (g_cfg.aim_bone_random < 0 || g_cfg.aim_bone_random > 1) g_cfg.aim_bone_random = 0;
+    if (g_cfg.aim_bone_interval < 50) g_cfg.aim_bone_interval = 50;
+    if (g_cfg.aim_bone_interval > 2000) g_cfg.aim_bone_interval = 2000;
+    if (g_cfg.aim_los < 0 || g_cfg.aim_los > 1) g_cfg.aim_los = 1;
     if (g_cfg.trigger_fov < 1) g_cfg.trigger_fov = 1;
     if (g_cfg.trigger_fov > 80) g_cfg.trigger_fov = 80;
     if (g_cfg.recoil_mode < 0) g_cfg.recoil_mode = 0;
@@ -358,6 +452,15 @@ static void cfg_load(void) {
     if (g_cfg.autoloot_range < 2) g_cfg.autoloot_range = 2;
     if (g_cfg.autoloot_range > 50) g_cfg.autoloot_range = 50;
     if (g_cfg.autoloot_key < 0 || g_cfg.autoloot_key > 254) g_cfg.autoloot_key = 0;
+    if (g_cfg.ign_dead < 0 || g_cfg.ign_dead > 1) g_cfg.ign_dead = 1;
+    if (g_cfg.ign_prone < 0 || g_cfg.ign_prone > 1) g_cfg.ign_prone = 0;
+    if (g_cfg.ign_party < 0 || g_cfg.ign_party > 1) g_cfg.ign_party = 1;
+    if (g_cfg.ign_clan < 0 || g_cfg.ign_clan > 1) g_cfg.ign_clan = 1;
+    if (g_cfg.ign_civilian < 0 || g_cfg.ign_civilian > 1) g_cfg.ign_civilian = 0;
+    if (g_cfg.menu_x < 0 || g_cfg.menu_y < 0) {
+        g_cfg.menu_x = -1;
+        g_cfg.menu_y = -1;
+    }
     cfg_apply();
 }
 
@@ -375,6 +478,16 @@ static IDWriteTextFormat*    g_fmt = NULL;
 static IDWriteTextFormat*    g_fmt_l = NULL;
 static IDWriteTextFormat*    g_fmt_r = NULL;
 static IDWriteTextFormat*    g_fmt_t = NULL;
+/* Unified menu faces. Bahnschrift is the closest stock Windows match for the
+ * condensed technical look; make_ui_fmt falls back to Segoe UI when it is not
+ * installed. Values stay monospaced so digits do not dance while dragging. */
+static IDWriteTextFormat*    g_fmt_ui = NULL;
+static IDWriteTextFormat*    g_fmt_uiv = NULL;
+static IDWriteTextFormat*    g_fmt_big = NULL;
+static IDWriteTextFormat*    g_fmt_small = NULL;
+static IDWriteTextFormat*    g_fmt_small_r = NULL;
+static IDWriteTextFormat*    g_fmt_key = NULL;
+static IDWriteTextFormat*    g_fmt_tab = NULL;
 static volatile LONG         g_draw_on = 1;
 static volatile LONG         g_frames = 0;
 static volatile LONG         g_players_seen = 0;
@@ -398,6 +511,32 @@ static D2D1_COLOR_F col(UINT32 argb, float mul) {
     c.g = ((argb >> 8) & 0xFF) / 255.0f * a;
     c.b = (argb & 0xFF) / 255.0f * a;
     return c;
+}
+
+/* One face helper for the menu. Everything is vertically centred so a row can
+ * pass its full height as the layout rect; alignment is the only difference
+ * between the label, value and hint faces. */
+static IDWriteTextFormat* make_ui_fmt(const wchar_t* family,
+                                      DWRITE_FONT_WEIGHT weight, float size,
+                                      DWRITE_TEXT_ALIGNMENT align) {
+    IDWriteTextFormat* f = NULL;
+    if (!g_dw) return NULL;
+    HRESULT hr = g_dw->CreateTextFormat(family, NULL, weight,
+                                        DWRITE_FONT_STYLE_NORMAL,
+                                        DWRITE_FONT_STRETCH_NORMAL, size,
+                                        L"en-us", &f);
+    if ((FAILED(hr) || !f) && wcscmp(family, L"Segoe UI") != 0) {
+        g_dw->CreateTextFormat(L"Segoe UI", NULL, weight,
+                               DWRITE_FONT_STYLE_NORMAL,
+                               DWRITE_FONT_STRETCH_NORMAL, size,
+                               L"en-us", &f);
+    }
+    if (f) {
+        f->SetTextAlignment(align);
+        f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    return f;
 }
 
 static void drop_target(void) {
@@ -533,6 +672,29 @@ static int d2d_init(IDXGISwapChain* swap) {
             g_fmt_r->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
         if (g_fmt_t) g_fmt_t->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+        /* Unified menu faces. */
+        if (!g_fmt_ui)
+            g_fmt_ui = make_ui_fmt(L"Bahnschrift", DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                   14.0f, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (!g_fmt_uiv)
+            g_fmt_uiv = make_ui_fmt(L"Consolas", DWRITE_FONT_WEIGHT_NORMAL,
+                                    13.0f, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (!g_fmt_big)
+            g_fmt_big = make_ui_fmt(L"Bahnschrift", DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                    24.0f, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (!g_fmt_small)
+            g_fmt_small = make_ui_fmt(L"Bahnschrift", DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                      10.5f, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (!g_fmt_small_r)
+            g_fmt_small_r = make_ui_fmt(L"Bahnschrift", DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                        10.5f, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        if (!g_fmt_key)
+            g_fmt_key = make_ui_fmt(L"Consolas", DWRITE_FONT_WEIGHT_NORMAL,
+                                    12.0f, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (!g_fmt_tab)
+            g_fmt_tab = make_ui_fmt(L"Bahnschrift", DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                    13.5f, DWRITE_TEXT_ALIGNMENT_LEADING);
     }
     ilog("d2d: context ready, device=%p", (void*)g_dev);
     return 1;
@@ -583,7 +745,9 @@ static void narrow_to_wide(const char* s, wchar_t* out, size_t cap) {
 enum {
     /* AIM */
     M_RAGE,
-    M_AIM, M_AIMKEY, M_AIMFOV, M_AIMSMOOTH, M_AIMBONE, M_AIMDIST, M_AIMCAL, M_AIMFIRE,
+    M_AIM, M_AIMCAM, M_AIMKEY, M_VISIBLE, M_AIMFOV, M_AIMSMOOTH, M_AIMBONE,
+    M_AIMDIST, M_AIMFIRE,
+    M_HUMANIZE, M_HUMSTR, M_HUMSPD, M_BONERAND, M_BONEINT,
     M_AA, M_AAMODE, M_AASPD, M_AARANGE, M_AAKEY,
     M_TRIG, M_TRIGKEY, M_TRIGDELAY, M_TRIGFOV, M_TRIGHEAD,
     M_NOSPREAD, M_NORECOIL, M_NCMODE, M_NCSTR,
@@ -595,26 +759,29 @@ enum {
     M_AUTOLOOT, M_ALLRANGE, M_ALLKEY,
     /* SYSTEM */
     M_MENUKEY, M_INKEY,
+    M_IGNDEAD, M_IGNPRONE, M_IGNPARTY, M_IGNCLAN, M_IGNCIV,
     M_COUNT
 };
 
 enum { TAB_AIM, TAB_VIS, TAB_LOOT, TAB_SYS, TAB_COUNT };
 
 static const wchar_t* const tab_label[TAB_COUNT] = {
-    L"AIM", L"VISUAL", L"LOOT", L"SYSTEM"
+    L"AIM", L"VISUALS", L"LOOT", L"SYSTEM"
 };
 
 static const unsigned char row_tab[M_COUNT] = {
-    TAB_AIM,
-    TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM,
-    TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM,
-    TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM,
-    TAB_AIM, TAB_AIM, TAB_AIM,
+    TAB_AIM,                                                     /* rage */
+    TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM,       /* aim..smooth */
+    TAB_AIM, TAB_AIM, TAB_AIM,                                  /* bone, range, fire */
+    TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM,                /* humanize */
+    TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM,                /* anti-aim */
+    TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM,                /* trigger */
+    TAB_AIM, TAB_AIM, TAB_AIM, TAB_AIM,                         /* nospread/recoil */
     TAB_VIS, TAB_VIS, TAB_VIS, TAB_VIS, TAB_VIS, TAB_VIS, TAB_VIS, TAB_VIS,
     TAB_VIS, TAB_VIS, TAB_VIS,
     TAB_LOOT, TAB_LOOT, TAB_LOOT, TAB_LOOT, TAB_LOOT, TAB_LOOT, TAB_LOOT,
     TAB_LOOT, TAB_LOOT, TAB_LOOT,
-    TAB_SYS, TAB_SYS
+    TAB_SYS, TAB_SYS, TAB_SYS, TAB_SYS, TAB_SYS, TAB_SYS, TAB_SYS
 };
 
 static int tab_first(int tab) {
@@ -640,6 +807,11 @@ static int tab_max_rows(void) {
     return best;
 }
 
+/* Toggle knob positions, animated toward the stored value so a click reads as
+ * motion. Sized by the row enum, one slot per row. */
+static float g_menu_anim[M_COUNT];
+static DWORD g_menu_anim_last = 0;
+
 /* The page's first row index for the row the cursor sits on. */
 static int tab_row_at(int tab, int slot) {
     const int n = tab_rows(tab);
@@ -653,6 +825,299 @@ static void text_in(const wchar_t* s, D2D1_RECT_F r, UINT32 argb, IDWriteTextFor
     g_brush->SetColor(col(argb, 1.0f));
     g_d2d_ctx->DrawText(s, (UINT32)wcslen(s), f, r, g_brush,
                         D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+}
+
+/* ---- unified menu painting helpers ---------------------------------------
+ * The panel is one window with a sidebar instead of a tab strip: rows, tabs,
+ * toggles and the footer all share these primitives so the hit-test geometry
+ * and the painted geometry cannot drift apart. */
+typedef struct { float x, y, w, h; } UI_RECT;
+
+#define UI_BG        0xFA0A0E14u
+#define UI_SIDEBAR   0xFF0C1118u
+#define UI_CONTENT   0xFF0F151Du
+#define UI_LINE      0xFF1B2633u
+#define UI_LINE_SOFT 0xFF151E28u
+#define UI_TEXT      0xFFEAF1F9u
+#define UI_MUTED     0xFF7C8998u
+#define UI_DIM       0xFF5B6877u
+#define UI_ACCENT    0xFF5CC8FFu
+#define UI_ACCENT_D  0xFF2A7FA6u
+#define UI_GREEN     0xFF5BE3A6u
+#define UI_RED       0xFFFF6478u
+#define UI_HOVER     0xFF121B25u
+#define UI_SELECT    0xFF16212Du
+
+static void ui_fill(float x, float y, float w, float h, UINT32 argb, float radius) {
+    if (!g_d2d_ctx || !g_brush || w <= 0.0f || h <= 0.0f) return;
+    D2D1_RECT_F r = D2D1::RectF(x, y, x + w, y + h);
+    g_brush->SetColor(col(argb, 1.0f));
+    if (radius > 0.0f) {
+        float rr = radius;
+        if (rr > h * 0.5f) rr = h * 0.5f;
+        if (rr > w * 0.5f) rr = w * 0.5f;
+        g_d2d_ctx->FillRoundedRectangle(D2D1::RoundedRect(r, rr, rr), g_brush);
+    } else {
+        g_d2d_ctx->FillRectangle(r, g_brush);
+    }
+}
+
+static void ui_stroke(float x, float y, float w, float h, UINT32 argb,
+                      float width, float radius) {
+    if (!g_d2d_ctx || !g_brush || w <= 0.0f || h <= 0.0f) return;
+    D2D1_RECT_F r = D2D1::RectF(x, y, x + w, y + h);
+    g_brush->SetColor(col(argb, 1.0f));
+    if (radius > 0.0f) {
+        float rr = radius;
+        if (rr > h * 0.5f) rr = h * 0.5f;
+        if (rr > w * 0.5f) rr = w * 0.5f;
+        g_d2d_ctx->DrawRoundedRectangle(D2D1::RoundedRect(r, rr, rr), g_brush, width);
+    } else {
+        g_d2d_ctx->DrawRectangle(r, g_brush, width);
+    }
+}
+
+static void ui_line(float x1, float y1, float x2, float y2, UINT32 argb, float width) {
+    if (!g_d2d_ctx || !g_brush) return;
+    g_brush->SetColor(col(argb, 1.0f));
+    g_d2d_ctx->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2), g_brush, width);
+}
+
+static void ui_text(const wchar_t* s, float x, float y, float w, float h,
+                    UINT32 argb, IDWriteTextFormat* f) {
+    if (!f || !s || !*s || w <= 0.0f || h <= 0.0f) return;
+    text_in(s, D2D1::RectF(x, y, x + w, y + h), argb, f);
+}
+
+static UINT32 ui_mix(UINT32 a, UINT32 b, float t) {
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    const int ar = (a >> 16) & 0xFF, ag = (a >> 8) & 0xFF, ab = a & 0xFF;
+    const int br = (b >> 16) & 0xFF, bg = (b >> 8) & 0xFF, bb = b & 0xFF;
+    const int r = (int)(ar + (br - ar) * t + 0.5f);
+    const int g = (int)(ag + (bg - ag) * t + 0.5f);
+    const int bl = (int)(ab + (bb - ab) * t + 0.5f);
+    return 0xFF000000u | ((UINT32)r << 16) | ((UINT32)g << 8) | (UINT32)bl;
+}
+
+static void ui_toggle(float x, float y, float w, float h, float t,
+                      UINT32 off, UINT32 on) {
+    ui_fill(x, y, w, h, ui_mix(off, on, t), h * 0.5f);
+    const float kd = h - 6.0f;
+    const float kx = x + 3.0f + t * (w - kd - 6.0f);
+    ui_fill(kx + 0.5f, y + 3.5f, kd, kd, 0x30000000u, kd * 0.5f);
+    ui_fill(kx, y + 3.0f, kd, kd, 0xFFF4F9FDu, kd * 0.5f);
+}
+
+static void ui_chevron(float cx, float cy, int dir, UINT32 argb) {
+    const float d = (dir < 0) ? -1.0f : 1.0f;
+    ui_line(cx - 3.0f * d, cy - 4.0f, cx + 1.0f * d, cy, argb, 1.3f);
+    ui_line(cx + 1.0f * d, cy, cx - 3.0f * d, cy + 4.0f, argb, 1.3f);
+}
+
+/* Which rows are switches, keybinds, choices or numbers. The row table stays
+ * the single source of truth for order; these helpers only tell the painter
+ * which control to draw on the right. */
+static int menu_toggle_value(int row) {
+    switch (row) {
+    case M_RAGE:     return g_cfg.rage;
+    case M_ESP:      return g_cfg.esp;
+    case M_BOX:      return g_cfg.boxes;
+    case M_NAME:     return g_cfg.names;
+    case M_SKEL:     return g_cfg.skeleton;
+    case M_HEALTH:   return g_cfg.health;
+    case M_DIST:     return g_cfg.distance;
+    case M_FOVC:     return g_cfg.fov_circle;
+    case M_AIM:      return g_cfg.aim;
+    case M_AIMCAM:   return g_cfg.aim_mode;
+    case M_VISIBLE:  return g_cfg.aim_los;
+    case M_AIMFIRE:  return g_cfg.aim_fire;
+    case M_HUMANIZE: return g_cfg.aim_humanize;
+    case M_BONERAND: return g_cfg.aim_bone_random;
+    case M_AA:       return g_cfg.aa;
+    case M_TRIG:     return g_cfg.trigger;
+    case M_TRIGHEAD: return g_cfg.trigger_head;
+    case M_NOSPREAD: return g_cfg.nospread;
+    case M_NORECOIL: return g_cfg.norecoil;
+    case M_RADAR:    return g_cfg.radar;
+    case M_RADLOOT:  return g_cfg.radar_loot;
+    case M_LOOT:     return g_cfg.loot;
+    case M_LOOTNODE: return g_cfg.loot_nodes;
+    case M_CONT:     return g_cfg.containers;
+    case M_DOOR:     return g_cfg.doors;
+    case M_DROP:     return g_cfg.dropped;
+    case M_VEHSL:    return g_cfg.vehicle_loot;
+    case M_PRICE:    return g_cfg.prices;
+    case M_AUTOLOOT: return g_cfg.autoloot;
+    case M_IGNDEAD:  return g_cfg.ign_dead;
+    case M_IGNPRONE: return g_cfg.ign_prone;
+    case M_IGNPARTY: return g_cfg.ign_party;
+    case M_IGNCLAN:  return g_cfg.ign_clan;
+    case M_IGNCIV:   return g_cfg.ign_civilian;
+    default:         return -1;
+    }
+}
+
+static int menu_rebind_id(int row) {
+    switch (row) {
+    case M_AIMKEY:   return 1;
+    case M_TRIGKEY:  return 2;
+    case M_ALLKEY:   return 3;
+    case M_AAKEY:    return 4;
+    case M_MENUKEY:  return 5;
+    case M_INKEY:    return 6;
+    default:         return 0;
+    }
+}
+
+typedef struct { int row, min, max, step; } MENU_NUM;
+static const MENU_NUM g_menu_nums[] = {
+    { M_MAXD,      10000, 200000, 10000 },
+    { M_AIMFOV,       10,    300,   10 },
+    { M_AIMSMOOTH,     1,    100,    1 },
+    { M_HUMSTR,        0,    100,    1 },
+    { M_HUMSPD,        1,    100,    1 },
+    { M_BONEINT,      50,   2000,   50 },
+    { M_AIMDIST,       0,   1000,   10 },
+    { M_AASPD,         1,    100,    5 },
+    { M_AARANGE,       1,     60,    1 },
+    { M_TRIGDELAY,     0,    300,   10 },
+    { M_TRIGFOV,       1,     80,    1 },
+    { M_NCSTR,         0,    200,   10 },
+    { M_RADRANGE,     25,    500,   10 },
+    { M_ALLRANGE,      2,     50,    1 },
+};
+
+static const MENU_NUM* menu_num(int row) {
+    for (unsigned i = 0; i < sizeof g_menu_nums / sizeof g_menu_nums[0]; ++i)
+        if (g_menu_nums[i].row == row) return &g_menu_nums[i];
+    return NULL;
+}
+
+static int menu_num_value(int row) {
+    switch (row) {
+    case M_MAXD:      return g_cfg.max_dist;
+    case M_AIMFOV:    return g_cfg.aim_fov;
+    case M_AIMSMOOTH: return g_cfg.aim_smooth;
+    case M_HUMSTR:    return g_cfg.aim_humanize_strength;
+    case M_HUMSPD:    return g_cfg.aim_humanize_speed;
+    case M_BONEINT:   return g_cfg.aim_bone_interval;
+    case M_AIMDIST:   return g_cfg.aim_dist;
+    case M_AASPD:     return g_cfg.aa_speed;
+    case M_AARANGE:   return g_cfg.aa_range;
+    case M_TRIGDELAY: return g_cfg.trigger_delay;
+    case M_TRIGFOV:   return g_cfg.trigger_fov;
+    case M_NCSTR:     return g_cfg.recoil_strength;
+    case M_RADRANGE:  return g_cfg.radar_range;
+    case M_ALLRANGE:  return g_cfg.autoloot_range;
+    default:          return 0;
+    }
+}
+
+static void menu_num_store(int row, int v) {
+    switch (row) {
+    case M_MAXD:      g_cfg.max_dist = v; break;
+    case M_AIMFOV:    g_cfg.aim_fov = v; break;
+    case M_AIMSMOOTH: g_cfg.aim_smooth = v; break;
+    case M_HUMSTR:    g_cfg.aim_humanize_strength = v; break;
+    case M_HUMSPD:    g_cfg.aim_humanize_speed = v; break;
+    case M_BONEINT:   g_cfg.aim_bone_interval = v; break;
+    case M_AIMDIST:   g_cfg.aim_dist = v; break;
+    case M_AASPD:     g_cfg.aa_speed = v; break;
+    case M_AARANGE:   g_cfg.aa_range = v; break;
+    case M_TRIGDELAY: g_cfg.trigger_delay = v; break;
+    case M_TRIGFOV:   g_cfg.trigger_fov = v; break;
+    case M_NCSTR:     g_cfg.recoil_strength = v; break;
+    case M_RADRANGE:  g_cfg.radar_range = v; break;
+    case M_ALLRANGE:  g_cfg.autoloot_range = v; break;
+    default: break;
+    }
+}
+
+static float menu_frac(int row) {
+    const MENU_NUM* n = menu_num(row);
+    if (!n) return -1.0f;
+    const int span = n->max - n->min;
+    if (span <= 0) return 0.0f;
+    float f = (float)(menu_num_value(row) - n->min) / (float)span;
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    return f;
+}
+
+/* Drag update: change the value but do not write the ini on every mouse move.
+ * menu_tick saves once on release. */
+static void menu_apply_frac(int row, float f) {
+    const MENU_NUM* n = menu_num(row);
+    if (!n) return;
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    int v = n->min + (int)(f * (float)(n->max - n->min) + 0.5f);
+    v = n->min + ((v - n->min + n->step / 2) / n->step) * n->step;
+    if (v < n->min) v = n->min;
+    if (v > n->max) v = n->max;
+    menu_num_store(row, v);
+    cfg_apply();
+}
+
+/* A slightly brighter rule where a logical group starts. Rows stay contiguous,
+ * so keyboard navigation and hit testing need no special cases. */
+static int menu_group_start(int row) {
+    switch (row) {
+    case M_RAGE: case M_HUMANIZE: case M_AA: case M_TRIG: case M_NOSPREAD:
+    case M_ESP: case M_RADAR:
+    case M_LOOT: case M_AUTOLOOT:
+    case M_MENUKEY: case M_IGNDEAD:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static const wchar_t* const tab_title[TAB_COUNT] = {
+    L"AIMBOT", L"VISUALS", L"LOOT", L"SYSTEM"
+};
+static const wchar_t* const tab_sub[TAB_COUNT] = {
+    L"target acquisition  /  smoothing  /  calibration",
+    L"player and world rendering",
+    L"item filters and automatic pickup",
+    L"input bindings and target filters"
+};
+
+static void menu_tab_icon(int tab, float x, float y, float s, UINT32 argb) {
+    const float cx = x + s * 0.5f, cy = y + s * 0.5f;
+    switch (tab) {
+    case TAB_AIM:
+        g_brush->SetColor(col(argb, 1.0f));
+        g_d2d_ctx->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy),
+                                             s * 0.22f, s * 0.22f), g_brush, 1.2f);
+        ui_line(cx - s * 0.36f, cy, cx - s * 0.22f, cy, argb, 1.2f);
+        ui_line(cx + s * 0.22f, cy, cx + s * 0.36f, cy, argb, 1.2f);
+        ui_line(cx, cy - s * 0.36f, cx, cy - s * 0.22f, argb, 1.2f);
+        ui_line(cx, cy + s * 0.22f, cx, cy + s * 0.36f, argb, 1.2f);
+        break;
+    case TAB_VIS:
+        ui_line(x + 1.0f, cy, cx, y + 2.0f, argb, 1.2f);
+        ui_line(cx, y + 2.0f, x + s - 1.0f, cy, argb, 1.2f);
+        ui_line(x + s - 1.0f, cy, cx, y + s - 2.0f, argb, 1.2f);
+        ui_line(cx, y + s - 2.0f, x + 1.0f, cy, argb, 1.2f);
+        ui_fill(cx - 1.6f, cy - 1.6f, 3.2f, 3.2f, argb, 1.6f);
+        break;
+    case TAB_LOOT:
+        ui_stroke(x + 1.5f, y + 2.5f, s - 3.0f, s - 5.0f, argb, 1.2f, 1.5f);
+        ui_line(x + 2.0f, y + 3.0f, cx, cy, argb, 1.1f);
+        ui_line(x + s - 2.0f, y + 3.0f, cx, cy, argb, 1.1f);
+        break;
+    case TAB_SYS:
+        for (int i = 0; i < 3; ++i) {
+            const float yy = y + 3.0f + (float)i * (s - 6.0f) * 0.5f;
+            ui_line(x + 1.0f, yy, x + s - 1.0f, yy, argb, 1.1f);
+            const float kx = x + 3.5f + (i == 1 ? s * 0.5f : s * 0.22f);
+            ui_fill(kx - 1.6f, yy - 1.6f, 3.2f, 3.2f, argb, 1.6f);
+        }
+        break;
+    default: break;
+    }
 }
 
 static const wchar_t* aa_label(int mode) {
@@ -737,14 +1202,16 @@ static void menu_text(int row, wchar_t* label, wchar_t* value, size_t cap) {
         MENU_ONOFF(g_cfg.rage);
         break;
     case M_AIM:      _snwprintf_s(label, cap, _TRUNCATE, L"aim");      MENU_ONOFF(g_cfg.aim);      break;
+    case M_AIMCAM:   _snwprintf_s(label, cap, _TRUNCATE, L"camera aim"); MENU_ONOFF(g_cfg.aim_mode); break;
     case M_AIMKEY:
         _snwprintf_s(label, cap, _TRUNCATE, L"aim key");
         _snwprintf_s(value, cap, _TRUNCATE, L"%s",
                      key_label(g_cfg.aim_key, kb, 32));
         break;
+    case M_VISIBLE:  _snwprintf_s(label, cap, _TRUNCATE, L"visible only"); MENU_ONOFF(g_cfg.aim_los); break;
     case M_AIMFOV:
         _snwprintf_s(label, cap, _TRUNCATE, L"aim fov");
-        _snwprintf_s(value, cap, _TRUNCATE, L"%d deg", g_cfg.aim_fov);
+        _snwprintf_s(value, cap, _TRUNCATE, L"%d px", g_cfg.aim_fov);
         break;
     case M_AIMSMOOTH:
         _snwprintf_s(label, cap, _TRUNCATE, L"smoothing");
@@ -758,11 +1225,21 @@ static void menu_text(int row, wchar_t* label, wchar_t* value, size_t cap) {
         _snwprintf_s(label, cap, _TRUNCATE, L"aim range");
         _snwprintf_s(value, cap, _TRUNCATE, L"%d m", g_cfg.aim_dist);
         break;
-    case M_AIMCAL:
-        _snwprintf_s(label, cap, _TRUNCATE, L"aim cal");
-        _snwprintf_s(value, cap, _TRUNCATE, L"%d", g_cfg.aim_cal);
-        break;
     case M_AIMFIRE:  _snwprintf_s(label, cap, _TRUNCATE, L"fire only"); MENU_ONOFF(g_cfg.aim_fire); break;
+    case M_HUMANIZE: _snwprintf_s(label, cap, _TRUNCATE, L"humanize"); MENU_ONOFF(g_cfg.aim_humanize); break;
+    case M_HUMSTR:
+        _snwprintf_s(label, cap, _TRUNCATE, L"humanize str");
+        _snwprintf_s(value, cap, _TRUNCATE, L"%d%%", g_cfg.aim_humanize_strength);
+        break;
+    case M_HUMSPD:
+        _snwprintf_s(label, cap, _TRUNCATE, L"humanize spd");
+        _snwprintf_s(value, cap, _TRUNCATE, L"%d%%", g_cfg.aim_humanize_speed);
+        break;
+    case M_BONERAND: _snwprintf_s(label, cap, _TRUNCATE, L"random bones"); MENU_ONOFF(g_cfg.aim_bone_random); break;
+    case M_BONEINT:
+        _snwprintf_s(label, cap, _TRUNCATE, L"bone interval");
+        _snwprintf_s(value, cap, _TRUNCATE, L"%d ms", g_cfg.aim_bone_interval);
+        break;
     case M_AA:       _snwprintf_s(label, cap, _TRUNCATE, L"anti-aim");   MENU_ONOFF(g_cfg.aa); break;
     case M_AAMODE:
         _snwprintf_s(label, cap, _TRUNCATE, L"aa mode");
@@ -839,6 +1316,11 @@ static void menu_text(int row, wchar_t* label, wchar_t* value, size_t cap) {
         _snwprintf_s(value, cap, _TRUNCATE, L"%s",
                      key_label(g_cfg.insert_key, kb, 32));
         break;
+    case M_IGNDEAD:  _snwprintf_s(label, cap, _TRUNCATE, L"ignore dead");  MENU_ONOFF(g_cfg.ign_dead);  break;
+    case M_IGNPRONE: _snwprintf_s(label, cap, _TRUNCATE, L"ignore prone"); MENU_ONOFF(g_cfg.ign_prone); break;
+    case M_IGNPARTY: _snwprintf_s(label, cap, _TRUNCATE, L"ignore party"); MENU_ONOFF(g_cfg.ign_party); break;
+    case M_IGNCLAN:  _snwprintf_s(label, cap, _TRUNCATE, L"ignore clan");  MENU_ONOFF(g_cfg.ign_clan);  break;
+    case M_IGNCIV:   _snwprintf_s(label, cap, _TRUNCATE, L"ignore civilian"); MENU_ONOFF(g_cfg.ign_civilian); break;
     default: break;
     }
 #undef MENU_ONOFF
@@ -861,12 +1343,14 @@ static void menu_set(int row, int dir, int act) {
     case M_DIST:     if (toggle) g_cfg.distance = !g_cfg.distance; break;
     case M_MAXD:
         if (dir) {
-            g_cfg.max_dist += dir * 5000;
-            if (g_cfg.max_dist < 5000) g_cfg.max_dist = 5000;
+            g_cfg.max_dist += dir * 10000;
+            if (g_cfg.max_dist < 10000) g_cfg.max_dist = 10000;
             if (g_cfg.max_dist > 200000) g_cfg.max_dist = 200000;
         }
         break;
     case M_AIM:      if (toggle) g_cfg.aim = !g_cfg.aim; break;
+    case M_AIMCAM:   if (toggle) g_cfg.aim_mode = !g_cfg.aim_mode; break;
+    case M_VISIBLE:  if (toggle) g_cfg.aim_los = !g_cfg.aim_los; break;
     case M_AIMKEY:   if (act) { g_menu_rebind = 1; g_menu_rebind_at = GetTickCount(); return; } break;
     case M_AIMFOV:
         if (dir) {
@@ -882,6 +1366,27 @@ static void menu_set(int row, int dir, int act) {
             if (g_cfg.aim_smooth > 100) g_cfg.aim_smooth = 100;
         }
         break;
+    case M_HUMSTR:
+        if (dir) {
+            g_cfg.aim_humanize_strength += dir;
+            if (g_cfg.aim_humanize_strength < 0) g_cfg.aim_humanize_strength = 0;
+            if (g_cfg.aim_humanize_strength > 100) g_cfg.aim_humanize_strength = 100;
+        }
+        break;
+    case M_HUMSPD:
+        if (dir) {
+            g_cfg.aim_humanize_speed += dir;
+            if (g_cfg.aim_humanize_speed < 1) g_cfg.aim_humanize_speed = 1;
+            if (g_cfg.aim_humanize_speed > 100) g_cfg.aim_humanize_speed = 100;
+        }
+        break;
+    case M_BONEINT:
+        if (dir) {
+            g_cfg.aim_bone_interval += dir * 50;
+            if (g_cfg.aim_bone_interval < 50) g_cfg.aim_bone_interval = 50;
+            if (g_cfg.aim_bone_interval > 2000) g_cfg.aim_bone_interval = 2000;
+        }
+        break;
     case M_AIMBONE:
         if (dir)
             g_cfg.aim_bone = (g_cfg.aim_bone + dir + RR_AIM_GROUP_COUNT) % RR_AIM_GROUP_COUNT;
@@ -893,14 +1398,9 @@ static void menu_set(int row, int dir, int act) {
             if (g_cfg.aim_dist > 1000) g_cfg.aim_dist = 1000;
         }
         break;
-    case M_AIMCAL:
-        if (dir) {
-            g_cfg.aim_cal += dir * 10;
-            if (g_cfg.aim_cal < 10) g_cfg.aim_cal = 10;
-            if (g_cfg.aim_cal > 2000) g_cfg.aim_cal = 2000;
-        }
-        break;
     case M_AIMFIRE:  if (toggle) g_cfg.aim_fire = !g_cfg.aim_fire; break;
+    case M_HUMANIZE: if (toggle) g_cfg.aim_humanize = !g_cfg.aim_humanize; break;
+    case M_BONERAND: if (toggle) g_cfg.aim_bone_random = !g_cfg.aim_bone_random; break;
     case M_AA:       if (toggle) g_cfg.aa = !g_cfg.aa; break;
     case M_AAMODE:
         if (dir || act)
@@ -979,9 +1479,23 @@ static void menu_set(int row, int dir, int act) {
     case M_FOVC:     if (toggle) g_cfg.fov_circle = !g_cfg.fov_circle; break;
     case M_MENUKEY:  if (act) { g_menu_rebind = 5; g_menu_rebind_at = GetTickCount(); return; } break;
     case M_INKEY:    if (act) { g_menu_rebind = 6; g_menu_rebind_at = GetTickCount(); return; } break;
+    case M_IGNDEAD:  if (toggle) g_cfg.ign_dead  = !g_cfg.ign_dead;  break;
+    case M_IGNPRONE: if (toggle) g_cfg.ign_prone = !g_cfg.ign_prone; break;
+    case M_IGNPARTY: if (toggle) g_cfg.ign_party = !g_cfg.ign_party; break;
+    case M_IGNCLAN:  if (toggle) g_cfg.ign_clan  = !g_cfg.ign_clan;  break;
+    case M_IGNCIV:   if (toggle) g_cfg.ign_civilian = !g_cfg.ign_civilian; break;
     default: return;
     }
     menu_save();
+    if (row == M_IGNDEAD || row == M_IGNPRONE || row == M_IGNPARTY ||
+        row == M_IGNCLAN || row == M_IGNCIV) {
+        const int allowed = RR_REL_POLICE |
+            (g_cfg.ign_clan ? 0 : RR_REL_CLAN) |
+            (g_cfg.ign_party ? 0 : RR_REL_PARTY);
+        ilog("cfg: ignore dead=%d prone=%d party=%d clan=%d civilian=%d targets=0x%X",
+             g_cfg.ign_dead, g_cfg.ign_prone, g_cfg.ign_party, g_cfg.ign_clan,
+             g_cfg.ign_civilian, allowed);
+    }
 }
 
 /* Keys are polled, not hooked: a low-level hook would fight the game's input
@@ -1004,73 +1518,167 @@ static int key_rep(int vk, KEYREP* st) {
 
 /* One geometry function for painting and for hit testing: a panel that answers
  * a pointer has to be laid out from the numbers it was painted with, or the
- * click lands a row off at a different resolution. The row shrinks on a short
- * viewport so the whole panel always fits. */
-typedef struct { float x, y, w, pad, row, rows, tabbar, h; } MENU_GEO;
+ * click lands a row off at a different resolution. The window is centred; the
+ * sidebar width is fixed and the row shrinks on a short viewport so the whole
+ * page always fits. */
+typedef struct {
+    float x, y, w, h;          /* window */
+    float side;                /* sidebar width */
+    float pad;                 /* content padding */
+    float row, rows;           /* row height and count */
+    float head, foot;          /* content header and footer heights */
+    float content_x, content_w;
+    float row_top;
+} MENU_GEO;
 
-static MENU_GEO menu_geo(float vh) {
+#define MENU_W      780.0f
+#define MENU_SIDE   188.0f
+#define MENU_HEAD    78.0f
+#define MENU_FOOT    44.0f
+#define MENU_PAD     22.0f
+#define MENU_CTL_W  176.0f
+#define MENU_TAB_H   42.0f
+#define MENU_TAB_TOP 84.0f   /* first tab; the strip above it drags the window */
+
+static MENU_GEO menu_geo(float vw, float vh) {
     MENU_GEO g;
     int n = tab_rows(g_menu_tab);
     if (n < 1) n = 1;
-    g.pad = 16.0f;
-    g.x = 48.0f;
-    g.y = 60.0f;
-    g.w = 620.0f;
-    g.row = 26.0f;
-    g.tabbar = 28.0f;
+    g.pad = MENU_PAD;
+    g.side = MENU_SIDE;
+    g.head = MENU_HEAD;
+    g.foot = MENU_FOOT;
     g.rows = (float)n;
-    if (vh > 140.0f) {
-        const float avail = vh - g.y - 8.0f - 34.0f - g.tabbar - 34.0f;
+    g.w = MENU_W;
+    if (g.w > vw - 48.0f) g.w = vw - 48.0f;
+    if (g.w < 560.0f) g.w = 560.0f;
+    if (g.side > g.w * 0.32f) g.side = g.w * 0.32f;
+    g.row = 31.0f;
+    {
+        const float margin = (vh > 240.0f) ? 36.0f : 8.0f;
+        const float avail = vh - margin * 2.0f - g.head - g.foot;
         const float fit = avail / g.rows;
         if (fit < g.row) g.row = fit;
     }
-    if (g.row < 15.0f) g.row = 15.0f;
-    g.h = 34.0f + g.tabbar + g.rows * g.row + 34.0f;
+    if (g.row < 20.0f) g.row = 20.0f;
+    g.h = g.head + g.rows * g.row + g.foot;
+    /* A dragged position is kept in surface pixels. Clamp only for painting
+     * and hit testing, so shrinking the window for a moment does not overwrite
+     * the place the player chose. */
+    if (g_cfg.menu_x >= 0 && g_cfg.menu_y >= 0) {
+        g.x = (float)g_cfg.menu_x;
+        g.y = (float)g_cfg.menu_y;
+    } else {
+        g.x = (vw - g.w) * 0.5f;
+        g.y = (vh - g.h) * 0.5f;
+    }
+    if (g.x > vw - g.w - 8.0f) g.x = vw - g.w - 8.0f;
+    if (g.y > vh - g.h - 8.0f) g.y = vh - g.h - 8.0f;
+    if (g.x < 8.0f) g.x = 8.0f;
+    if (g.y < 8.0f) g.y = 8.0f;
+    g.content_x = g.x + g.side;
+    g.content_w = g.w - g.side;
+    g.row_top = g.y + g.head;
     return g;
 }
 
-/* Rows start under the title strip and the tab bar. Painting and the hit test
- * both read this, so a click on a row lands on that row at every resolution. */
-static float menu_rows_top(const MENU_GEO* g) { return g->y + 34.0f + g->tabbar; }
+/* Tabs are stacked in the sidebar card under the logo. */
+static UI_RECT menu_tab_rect(const MENU_GEO* g, int tab) {
+    UI_RECT r;
+    r.x = g->x + 18.0f;
+    r.w = g->side - 36.0f;
+    r.h = MENU_TAB_H;
+    r.y = g->y + MENU_TAB_TOP + (float)tab * (MENU_TAB_H + 6.0f);
+    return r;
+}
+
+/* Rows start under the content header. Painting and the hit test both read
+ * this, so a click on a row lands on that row at every resolution. */
+static float menu_rows_top(const MENU_GEO* g) { return g->row_top; }
 
 /* Cursor position in the swapchain's pixel space. The game hides its own
- * pointer during a match, so the panel paints one at this position. */
+ * pointer during a match, so the panel paints one at this position. The client
+ * is not always the swapchain size (DPI, borderless scaling), so the point is
+ * scaled exactly like the painted surface. */
 static int menu_cursor(float* out_x, float* out_y) {
     POINT pt;
-    if (!g_game_hwnd) return 0;
+    RECT rc;
+    if (!g_game_hwnd || !IsWindow(g_game_hwnd)) return 0;
+    if (g_vw < 64.0f || g_vh < 64.0f) return 0;
     if (!GetCursorPos(&pt)) return 0;
+    if (!GetClientRect(g_game_hwnd, &rc)) return 0;
     if (!ScreenToClient(g_game_hwnd, &pt)) return 0;
-    *out_x = (float)pt.x;
-    *out_y = (float)pt.y;
+    {
+        const float cw = (float)(rc.right - rc.left);
+        const float ch = (float)(rc.bottom - rc.top);
+        if (cw < 1.0f || ch < 1.0f) return 0;
+        *out_x = (float)pt.x * (g_vw / cw);
+        *out_y = (float)pt.y * (g_vh / ch);
+    }
     return 1;
 }
 
-/* Tab cell under a point, or -1. The bar is TAB_COUNT equal cells across the
- * panel width, which is what draw_menu paints. */
+static int menu_hit(UI_RECT r, float x, float y) {
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+}
+
+/* The logo block and the content header are one drag handle. On the sidebar
+ * the strip stops at the first tab; in the content it stops at the header
+ * rule, because the first row begins there. Neither area can steal a control
+ * press. */
+static int menu_title_at(const MENU_GEO* g, float x, float y) {
+    if (x < g->x || x > g->x + g->w || y < g->y) return 0;
+    if (x < g->content_x) return y < g->y + MENU_TAB_TOP;
+    return y < g->y + g->head;
+}
+
 static int menu_tab_at(float cx, float cy) {
-    const MENU_GEO g = menu_geo(g_vh);
-    const float top = g.y + 34.0f;
-    const float cell = g.w / (float)TAB_COUNT;
+    const MENU_GEO g = menu_geo(g_vw, g_vh);
     int t;
-    if (cx < g.x || cx > g.x + g.w) return -1;
-    if (cy < top || cy > top + g.tabbar) return -1;
-    if (cell <= 0.0f) return -1;
-    t = (int)((cx - g.x) / cell);
-    if (t < 0 || t >= TAB_COUNT) return -1;
-    return t;
+    for (t = 0; t < TAB_COUNT; ++t)
+        if (menu_hit(menu_tab_rect(&g, t), cx, cy)) return t;
+    return -1;
 }
 
 /* Screen row to the global row index of the active tab. */
 static int menu_row_at(float cx, float cy) {
-    const MENU_GEO g = menu_geo(g_vh);
+    const MENU_GEO g = menu_geo(g_vw, g_vh);
     const float top = menu_rows_top(&g);
     int slot;
-    if (cx < g.x || cx > g.x + g.w) return -1;
+    if (cx < g.content_x || cx > g.x + g.w) return -1;
     if (cy < top || cy > top + g.rows * g.row) return -1;
     slot = (int)((cy - top) / g.row);
     if (slot < 0) slot = 0;
     if (slot >= (int)g.rows) slot = (int)g.rows - 1;
     return tab_row_at(g_menu_tab, slot);
+}
+
+/* Which right-hand control a row paints. The row table stays the single source
+ * of truth for order; this only picks the widget. */
+enum { MK_TOGGLE, MK_NUMBER, MK_CHOICE, MK_KEY };
+
+static int menu_kind(int row) {
+    if (menu_rebind_id(row)) return MK_KEY;
+    if (menu_num(row)) return MK_NUMBER;
+    switch (row) {
+    case M_AIMBONE:
+    case M_AAMODE:
+    case M_NCMODE:
+        return MK_CHOICE;
+    default:
+        return MK_TOGGLE;
+    }
+}
+
+/* The control strip on the right of a row. Tick and draw both read this, so a
+ * drag starts exactly where the track is painted. */
+static UI_RECT menu_ctl_rect(const MENU_GEO* g, int slot) {
+    UI_RECT r;
+    r.w = MENU_CTL_W;
+    r.h = 22.0f;
+    r.x = g->x + g->w - g->pad - r.w;
+    r.y = menu_rows_top(g) + (float)slot * g->row + (g->row - r.h) * 0.5f;
+    return r;
 }
 
 /* Keeps the cursor inside the page after a tab switch or a resize. */
@@ -1087,19 +1695,36 @@ static void menu_tick(void) {
     int dir = 0, act = 0, vk;
 
     if (key_rep(g_cfg.menu_key, &k_menu)) {
-        g_menu_open = !g_menu_open;
+        if (!g_menu_open) {
+            g_menu_clip_saved = GetClipCursor(&g_menu_clip);
+            g_menu_open = 1;
+        } else {
+            g_menu_open = 0;
+            if (g_menu_clip_saved && rr_gate_foreground()) ClipCursor(&g_menu_clip);
+            g_menu_clip_saved = 0;
+        }
         g_menu_rebind = 0;
         g_menu_hover = -1;
+        g_menu_hover_tab = -1;
+        g_menu_drag_row = -1;
+        /* A drag interrupted by the menu key still keeps where the player put
+         * the window. */
+        if (g_menu_win_moved) menu_save();
+        g_menu_win_drag = 0;
+        g_menu_win_moved = 0;
         /* The press that opened the panel must not also click a row. */
         g_menu_lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         cfg_apply();
+        /* Flip the window filter in the same frame instead of waiting for
+         * maint_tick, so the next key or mouse message is already blocked. */
+        rr_gate_set_open(g_menu_open);
         ilog("menu: %s tab=%d", g_menu_open ? "open" : "closed", g_menu_tab);
     }
     if (!g_menu_open) return;
 
     /* The game clips the pointer to its window while the match runs; releasing
      * the clip is what lets the OS position follow the mouse over the panel. */
-    ClipCursor(NULL);
+    if (rr_gate_foreground()) ClipCursor(NULL);
 
     if (g_menu_rebind) {
         const DWORD since = GetTickCount() - g_menu_rebind_at;
@@ -1133,57 +1758,159 @@ static void menu_tick(void) {
         return;
     }
 
-    /* Tab bar first: a click there switches page and must not fall through to
-     * the row under the pointer. */
-    if (g_vh > 140.0f) {
-        float cx = 0.0f, cy = 0.0f;
-        const int lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-        if (menu_cursor(&cx, &cy)) {
-            const int tab = menu_tab_at(cx, cy);
-            if (tab >= 0 && lmb && !g_menu_lmb) {
-                g_menu_tab = tab;
-                g_menu_sel = 0;
-                g_menu_hover = -1;
-                g_menu_lmb = lmb;
-                cfg_apply();
-                return;
+    /* Toggle knob animation, time based so it looks the same at any frame
+     * rate. Non-toggle rows hold at zero; their slot is simply unused. */
+    {
+        const DWORD now = GetTickCount();
+        float dt = g_menu_anim_last ? (float)(now - g_menu_anim_last) : 16.0f;
+        g_menu_anim_last = now;
+        if (dt > 100.0f) dt = 100.0f;
+        {
+            const float step = dt / 130.0f;
+            int r;
+            for (r = 0; r < M_COUNT; ++r) {
+                const float want = (menu_toggle_value(r) > 0) ? 1.0f : 0.0f;
+                if (g_menu_anim[r] < want) {
+                    g_menu_anim[r] += step;
+                    if (g_menu_anim[r] > want) g_menu_anim[r] = want;
+                } else if (g_menu_anim[r] > want) {
+                    g_menu_anim[r] -= step;
+                    if (g_menu_anim[r] < want) g_menu_anim[r] = want;
+                }
             }
         }
     }
 
-    /* Pointer next: hover paints the highlight, a left click commits the row.
-     * A value row steps toward the half that was clicked, so one button covers
-     * both directions without a modifier, and a switch toggles from either
-     * half. */
-    if (g_vh > 140.0f) {
+    menu_clamp_sel();
+
+    /* Pointer: tabs first, then rows. A tab click must not fall through to the
+     * row under the pointer, and a number row starts a scrub when the press
+     * lands on its track. */
+    {
         float cx = 0.0f, cy = 0.0f;
-        const int lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-        if (menu_cursor(&cx, &cy)) {
+        const int down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        const int edge = down && !g_menu_lmb;
+        const int have = menu_cursor(&cx, &cy);
+        const MENU_GEO g = menu_geo(g_vw, g_vh);
+
+        /* A press on the title strip starts a window drag. Handle it before
+         * tabs and rows so the same press cannot also toggle a control. */
+        if (have && edge && !g_menu_rebind && menu_title_at(&g, cx, cy)) {
+            g_menu_win_drag = 1;
+            g_menu_win_moved = 0;
+            g_menu_grab_x = cx - g.x;
+            g_menu_grab_y = cy - g.y;
+            g_menu_hover = g_menu_hover_tab = -1;
+            g_menu_lmb = down;
+            return;
+        }
+        if (g_menu_win_drag) {
+            if (have && down) {
+                float nx = cx - g_menu_grab_x;
+                float ny = cy - g_menu_grab_y;
+                const float maxx = (g_vw - g.w - 8.0f > 8.0f) ? g_vw - g.w - 8.0f : 8.0f;
+                const float maxy = (g_vh - g.h - 8.0f > 8.0f) ? g_vh - g.h - 8.0f : 8.0f;
+                if (nx < 8.0f) nx = 8.0f;
+                if (ny < 8.0f) ny = 8.0f;
+                if (nx > maxx) nx = maxx;
+                if (ny > maxy) ny = maxy;
+                if ((int)(nx + 0.5f) != (int)(g.x + 0.5f) ||
+                    (int)(ny + 0.5f) != (int)(g.y + 0.5f))
+                    g_menu_win_moved = 1;
+                g_cfg.menu_x = (int)(nx + 0.5f);
+                g_cfg.menu_y = (int)(ny + 0.5f);
+                g_menu_hover = g_menu_hover_tab = -1;
+            }
+            if (!down) {
+                if (g_menu_win_moved) menu_save();
+                g_menu_win_drag = 0;
+                g_menu_win_moved = 0;
+            }
+            g_menu_lmb = down;
+            return;
+        }
+
+        if (have) {
+            const int tab = menu_tab_at(cx, cy);
             const int row = menu_row_at(cx, cy);
+            g_menu_hover_tab = tab;
             g_menu_hover = row;
-            if (row >= 0 && lmb && !g_menu_lmb) {
-                const MENU_GEO g = menu_geo(g_vh);
-                g_menu_sel = row - tab_first(g_menu_tab);
-                g_menu_lmb = lmb;
-                menu_set(row, cx > g.x + g.w * 0.5f ? 1 : -1, 1);
+
+            if (edge && tab >= 0) {
+                if (tab != g_menu_tab) {
+                    g_menu_tab = tab;
+                    g_menu_sel = 0;
+                    g_menu_hover = -1;
+                    g_menu_drag_row = -1;
+                    cfg_apply();
+                }
+                g_menu_lmb = down;
+                return;
+            }
+            if (edge && row >= 0) {
+                const int kind = menu_kind(row);
+                const int slot = row - tab_first(g_menu_tab);
+                const UI_RECT ctl = menu_ctl_rect(&g, slot);
+                g_menu_sel = slot;
+                if (kind == MK_TOGGLE) {
+                    menu_set(row, 0, 1);
+                } else if (kind == MK_KEY) {
+                    menu_set(row, 0, 1);   /* arms the rebind and returns */
+                } else if (kind == MK_NUMBER) {
+                    if (menu_hit(ctl, cx, cy)) {
+                        g_menu_drag_row = row;
+                        g_menu_drag_x0 = cx;
+                        g_menu_drag_moved = 0;
+                    } else {
+                        menu_set(row, cx > g.content_x + g.content_w * 0.5f ? 1 : -1, 1);
+                    }
+                } else {
+                    int d;
+                    if (cx < ctl.x + 24.0f) d = -1;
+                    else if (cx > ctl.x + ctl.w - 24.0f) d = 1;
+                    else d = (cx > g.x + g.w * 0.5f) ? 1 : -1;
+                    menu_set(row, d, 1);
+                }
+                g_menu_lmb = down;
                 return;
             }
         } else {
-            g_menu_hover = -1;
+            g_menu_hover = g_menu_hover_tab = -1;
         }
-        g_menu_lmb = lmb;
+
+        /* Scrubbing continues while the button is held, even when the pointer
+         * leaves the track; releasing commits the ini once. */
+        if (have && g_menu_drag_row >= 0 && down) {
+            const int slot = g_menu_drag_row - tab_first(g_menu_tab);
+            const UI_RECT ctl = menu_ctl_rect(&g, slot);
+            if (!g_menu_drag_moved && fabsf(cx - g_menu_drag_x0) >= 2.0f)
+                g_menu_drag_moved = 1;
+            if (slot >= 0 && slot < (int)g.rows && g_menu_drag_moved)
+                menu_apply_frac(g_menu_drag_row,
+                                (cx - (ctl.x + 16.0f)) / (ctl.w - 32.0f));
+        }
+        if (!down && g_menu_drag_row >= 0) {
+            if (g_menu_drag_moved) menu_save();
+            g_menu_drag_row = -1;
+            g_menu_drag_moved = 0;
+        }
+        g_menu_lmb = down;
     }
 
     if (key_rep(VK_PRIOR, &k_pgup)) {
         g_menu_tab = (g_menu_tab + TAB_COUNT - 1) % TAB_COUNT;
         g_menu_sel = 0;
         g_menu_hover = -1;
+        g_menu_hover_tab = -1;
+        g_menu_drag_row = -1;
         return;
     }
     if (key_rep(VK_NEXT, &k_pgdn)) {
         g_menu_tab = (g_menu_tab + 1) % TAB_COUNT;
         g_menu_sel = 0;
         g_menu_hover = -1;
+        g_menu_hover_tab = -1;
+        g_menu_drag_row = -1;
         return;
     }
 
@@ -1202,123 +1929,291 @@ static void menu_tick(void) {
 }
 
 static void draw_menu(float W, float H, int seen) {
-    const MENU_GEO g = menu_geo(H);
-    D2D1_RECT_F box;
-    wchar_t title[96];
-    int k;
+    const MENU_GEO g = menu_geo(W, H);
+    int k, t;
+    RR_AIM_FRAME af;
+    float cur_x = 0.0f, cur_y = 0.0f;
+    int have_cur, on_title;
 
-    (void)W;
-    if (!g_fmt_l || !g_fmt_r || !g_fmt_t) return;
-    if (g.h > H - g.y - 8.0f) return;   /* skip rather than draw a clipped panel */
+    if (!g_d2d_ctx || !g_brush) return;
+    if (!g_fmt_ui || !g_fmt_uiv || !g_fmt_big || !g_fmt_small ||
+        !g_fmt_small_r || !g_fmt_key || !g_fmt_tab) return;
 
-    box.left = g.x; box.top = g.y; box.right = g.x + g.w; box.bottom = g.y + g.h;
-    g_brush->SetColor(col(0xF20B1017, 1.0f));
-    g_d2d_ctx->FillRectangle(box, g_brush);
-    g_brush->SetColor(col(0xFF39FF88, 1.0f));
-    g_d2d_ctx->DrawRectangle(box, g_brush, 2.0f);
+    have_cur = menu_cursor(&cur_x, &cur_y);
+    on_title = have_cur && menu_title_at(&g, cur_x, cur_y);
 
-    _snwprintf_s(title, 96, _TRUNCATE, L"rr_int   menu %s   seen %d",
-                 g_cfg.rage ? L"[RAGE]" : L"", seen);
+    /* Drop shadow: two offset fills are the cheapest way to get depth without
+     * an effect graph. */
+    ui_fill(g.x + 6.0f, g.y + 12.0f, g.w, g.h, 0x40000000u, 14.0f);
+    ui_fill(g.x + 2.0f, g.y + 6.0f, g.w, g.h, 0x30000000u, 12.0f);
+
+    /* Window body and its hairline accent. */
+    ui_fill(g.x, g.y, g.w, g.h, UI_BG, 12.0f);
+    ui_stroke(g.x + 0.5f, g.y + 0.5f, g.w - 1.0f, g.h - 1.0f, UI_LINE, 1.0f, 12.0f);
+    ui_line(g.x + 14.0f, g.y + 1.0f, g.x + g.w - 14.0f, g.y + 1.0f,
+            0x405CC8FFu, 1.0f);
+
+    /* Sidebar card, logo, tabs and the close hint. */
     {
-        D2D1_RECT_F r;
-        r.left = g.x + g.pad; r.top = g.y + 8.0f;
-        r.right = g.x + g.w - g.pad; r.bottom = g.y + 30.0f;
-        text_in(title, r, g_cfg.rage ? 0xFFFF7A5C : 0xFF39FF88, g_fmt_t);
-    }
+        const float sx = g.x + 8.0f, sy = g.y + 8.0f;
+        const float sw = g.side - 16.0f, sh = g.h - 16.0f;
 
-    /* Tab bar. The active page is the only one with a filled cell, and the
-     * cells are the same split menu_tab_at() hit-tests. */
-    {
-        const float cell = g.w / (float)TAB_COUNT;
-        int t;
+        ui_fill(sx, sy, sw, sh, UI_SIDEBAR, 9.0f);
+        ui_stroke(sx + 0.5f, sy + 0.5f, sw - 1.0f, sh - 1.0f,
+                  UI_LINE_SOFT, 1.0f, 9.0f);
+        ui_line(g.content_x + 0.5f, g.y + 12.0f, g.content_x + 0.5f,
+                g.y + g.h - 12.0f, UI_LINE_SOFT, 1.0f);
+
+        /* Logo: an accent tile with a reticle, then the wordmark. */
+        {
+            const float lx = sx + 14.0f, ly = sy + 16.0f, ls = 30.0f;
+            const float icx = lx + ls * 0.5f, icy = ly + ls * 0.5f;
+            ui_fill(lx, ly, ls, ls, UI_ACCENT, 8.0f);
+            g_brush->SetColor(col(0xFF07121Bu, 1.0f));
+            g_d2d_ctx->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(icx, icy),
+                                                 7.0f, 7.0f), g_brush, 1.4f);
+            ui_line(icx - 11.0f, icy, icx - 7.0f, icy, 0xFF07121Bu, 1.4f);
+            ui_line(icx + 7.0f, icy, icx + 11.0f, icy, 0xFF07121Bu, 1.4f);
+            ui_line(icx, icy - 11.0f, icx, icy - 7.0f, 0xFF07121Bu, 1.4f);
+            ui_line(icx, icy + 7.0f, icx, icy + 11.0f, 0xFF07121Bu, 1.4f);
+            ui_text(L"ROBRUN", lx + ls + 10.0f, ly - 2.0f, 110.0f, 20.0f,
+                    UI_TEXT, g_fmt_ui);
+            ui_text(L"INTERNAL", lx + ls + 10.0f, ly + 15.0f, 110.0f, 14.0f,
+                    UI_DIM, g_fmt_small);
+        }
+
         for (t = 0; t < TAB_COUNT; ++t) {
-            D2D1_RECT_F rc;
-            wchar_t name[24];
-            rc.left = g.x + t * cell + 4.0f;
-            rc.right = g.x + (t + 1) * cell - 4.0f;
-            rc.top = g.y + 34.0f + 2.0f;
-            rc.bottom = g.y + 34.0f + g.tabbar - 2.0f;
-            if (t == g_menu_tab) {
-                g_brush->SetColor(col(0x3339FF88, 1.0f));
-                g_d2d_ctx->FillRectangle(rc, g_brush);
-                g_brush->SetColor(col(0xFF39FF88, 1.0f));
-                g_d2d_ctx->DrawRectangle(rc, g_brush, 1.4f);
+            const UI_RECT tr = menu_tab_rect(&g, t);
+            const int active = (t == g_menu_tab);
+            const int hot = (t == g_menu_hover_tab);
+
+            if (active) {
+                ui_fill(tr.x, tr.y, tr.w, tr.h, UI_SELECT, 7.0f);
+                ui_fill(tr.x, tr.y + 9.0f, 2.5f, tr.h - 18.0f, UI_ACCENT, 1.25f);
+                ui_stroke(tr.x + 0.5f, tr.y + 0.5f, tr.w - 1.0f, tr.h - 1.0f,
+                          UI_LINE, 1.0f, 7.0f);
+            } else if (hot) {
+                ui_fill(tr.x, tr.y, tr.w, tr.h, UI_HOVER, 7.0f);
             }
-            _snwprintf_s(name, 24, _TRUNCATE, L"%s", tab_label[t]);
-            rc.left += 8.0f;
-            text_in(name, rc, t == g_menu_tab ? 0xFF39FF88 : 0xFF98A1B2, g_fmt_l);
+            menu_tab_icon(t, tr.x + 13.0f, tr.y + (tr.h - 16.0f) * 0.5f, 16.0f,
+                          active ? UI_ACCENT : (hot ? UI_TEXT : UI_MUTED));
+            ui_text(tab_label[t], tr.x + 40.0f, tr.y, tr.w - 50.0f, tr.h,
+                    active ? UI_TEXT : (hot ? 0xFFC8D4E2u : UI_MUTED), g_fmt_tab);
+        }
+
+        /* Close hint, painted as a keycap. */
+        {
+            wchar_t kb[32];
+            const wchar_t* name = key_label(g_cfg.menu_key, kb, 32);
+            const float fy = g.y + g.h - 46.0f;
+            const float kx = sx + sw - 16.0f - 56.0f;
+            ui_text(L"CLOSE", sx + 16.0f, fy, 80.0f, 22.0f, UI_DIM, g_fmt_small);
+            ui_fill(kx, fy + 1.0f, 56.0f, 20.0f, UI_HOVER, 5.0f);
+            ui_stroke(kx + 0.5f, fy + 1.5f, 55.0f, 19.0f, UI_LINE, 1.0f, 5.0f);
+            ui_text(name, kx, fy + 1.0f, 56.0f, 20.0f, UI_MUTED, g_fmt_key);
         }
     }
 
+    /* Content header. The dotted grip is the window handle: the same strip is
+     * what menu_tick uses to start a drag. */
+    {
+        const float hx = g.content_x + g.pad;
+        int gr, gc;
+        for (gr = 0; gr < 3; ++gr)
+            for (gc = 0; gc < 2; ++gc)
+                ui_fill(hx + (float)gc * 4.0f, g.y + 24.0f + (float)gr * 5.0f,
+                        2.0f, 2.0f,
+                        (on_title || g_menu_win_drag) ? UI_ACCENT : 0x66AFC4DAu,
+                        1.0f);
+        ui_text(tab_title[g_menu_tab], hx + 16.0f, g.y + 16.0f,
+                g.content_w - g.pad * 2.0f - 126.0f, 30.0f, UI_TEXT, g_fmt_big);
+        ui_text(tab_sub[g_menu_tab], hx + 16.0f, g.y + 44.0f,
+                g.content_w - g.pad * 2.0f - 126.0f, 18.0f, UI_DIM, g_fmt_small);
+    }
+
+    /* Status pill and the live player count, top right of the content. */
+    {
+        const int live = g_cfg.rage || g_cfg.aim || g_cfg.trigger || g_cfg.esp ||
+                         g_cfg.loot || g_cfg.radar || g_cfg.aa;
+        const float pw = 88.0f, ph = 24.0f;
+        const float px = g.x + g.w - g.pad - pw, py = g.y + 20.0f;
+        wchar_t seen_txt[32];
+
+        ui_fill(px, py, pw, ph, live ? 0x1F5BE3A6u : 0x14FFFFFFu, ph * 0.5f);
+        ui_stroke(px + 0.5f, py + 0.5f, pw - 1.0f, ph - 1.0f,
+                  live ? 0x405BE3A6u : UI_LINE, 1.0f, ph * 0.5f);
+        g_brush->SetColor(col(live ? UI_GREEN : UI_DIM, 1.0f));
+        g_d2d_ctx->FillEllipse(
+            D2D1::Ellipse(D2D1::Point2F(px + 15.0f, py + ph * 0.5f),
+                          3.2f, 3.2f), g_brush);
+        ui_text(live ? L"ACTIVE" : L"IDLE", px + 24.0f, py, pw - 30.0f, ph,
+                live ? UI_GREEN : UI_DIM, g_fmt_small);
+        _snwprintf_s(seen_txt, 32, _TRUNCATE, L"%d SEEN", seen);
+        ui_text(seen_txt, g.x + g.w - g.pad - 120.0f, g.y + 47.0f,
+                120.0f, 16.0f, UI_DIM, g_fmt_small_r);
+    }
+
+    ui_line(g.content_x + g.pad, g.y + g.head - 1.0f,
+            g.x + g.w - g.pad, g.y + g.head - 1.0f, UI_LINE_SOFT, 1.0f);
+
+    /* Rows. Group starts get a soft rule; the label and the right-hand widget
+     * are both laid out from the same geometry the pointer uses. */
     for (k = 0; k < (int)g.rows; ++k) {
         const int row = tab_row_at(g_menu_tab, k);
         wchar_t label[64], value[64];
-        const float top = menu_rows_top(&g) + k * g.row;
-        int lit;
-        D2D1_RECT_F rl, rv;
+        const float top = menu_rows_top(&g) + (float)k * g.row;
+        const UI_RECT ctl = menu_ctl_rect(&g, k);
+        const int sel = (k == g_menu_sel);
+        const int hot = (row == g_menu_hover);
+        const int kind = menu_kind(row);
+        int i;
 
         menu_text(row, label, value, 64);
-        lit = (k == g_menu_sel) || (row == g_menu_hover);
-        if (lit) {
-            D2D1_RECT_F sel;
-            sel.left = g.x + 5.0f; sel.top = top + 1.0f;
-            sel.right = g.x + g.w - 5.0f; sel.bottom = top + g.row - 2.0f;
-            g_brush->SetColor(col(k == g_menu_sel ? 0x30FFFFFF : 0x1CFFFFFF, 1.0f));
-            g_d2d_ctx->FillRectangle(sel, g_brush);
-            if (k == g_menu_sel) {
-                g_brush->SetColor(col(0xFF39FF88, 1.0f));
-                sel.left = g.x + 5.0f; sel.right = g.x + 8.0f;
-                g_d2d_ctx->FillRectangle(sel, g_brush);
-            }
+        for (i = 0; label[i]; ++i)
+            if (label[i] >= L'a' && label[i] <= L'z') label[i] -= 32;
+
+        if (menu_group_start(row) && k > 0)
+            ui_line(g.content_x + g.pad, top, g.x + g.w - g.pad, top,
+                    UI_LINE_SOFT, 1.0f);
+
+        if (sel || hot) {
+            ui_fill(g.content_x + 8.0f, top + 2.0f,
+                    g.content_w - 16.0f, g.row - 4.0f,
+                    sel ? UI_SELECT : UI_HOVER, 6.0f);
+            if (sel)
+                ui_fill(g.content_x + 8.0f, top + 8.0f, 2.0f, g.row - 16.0f,
+                        UI_ACCENT, 1.0f);
         }
-        if (row == M_RAGE && g_cfg.rage) {
-            rl.left = g.x + g.pad; rl.top = top; rl.right = g.x + g.w * 0.58f; rl.bottom = top + g.row;
-            text_in(label, rl, 0xFFFF7A5C, g_fmt_l);
-        } else {
-            rl.left = g.x + g.pad; rl.top = top; rl.right = g.x + g.w * 0.58f; rl.bottom = top + g.row;
-            text_in(label, rl, lit ? 0xFFFFFFFF : 0xFFC6CBD5, g_fmt_l);
+
+        {
+            const UINT32 lc = (row == M_RAGE && g_cfg.rage) ? UI_RED
+                            : sel ? UI_TEXT
+                            : hot ? 0xFFDCE6F2u : 0xFFC2CEDA;
+            ui_text(label, g.content_x + g.pad, top,
+                    ctl.x - (g.content_x + g.pad) - 12.0f, g.row, lc, g_fmt_ui);
         }
-        rv.left = g.x + g.w * 0.50f; rv.top = top; rv.right = g.x + g.w - g.pad; rv.bottom = top + g.row;
-        text_in(value, rv, k == g_menu_sel ? 0xFF39FF88 : lit ? 0xFFDDE3EC : 0xFF98A1B2, g_fmt_r);
+
+        switch (kind) {
+        case MK_TOGGLE: {
+            const float tw = 46.0f, th = 22.0f;
+            const float tx = ctl.x + ctl.w - tw;
+            const int on = g_menu_anim[row] > 0.5f;
+            ui_toggle(tx, ctl.y, tw, th, g_menu_anim[row],
+                      0xFF1D2835u, UI_ACCENT);
+            ui_text(on ? L"ON" : L"OFF", tx - 46.0f, ctl.y, 40.0f, th,
+                    on ? UI_GREEN : UI_DIM, g_fmt_small_r);
+            break;
+        }
+        case MK_KEY: {
+            const float kw = 108.0f, kh = 22.0f;
+            const float kx = ctl.x + ctl.w - kw;
+            const int bound = (g_menu_rebind &&
+                               menu_rebind_id(row) == g_menu_rebind);
+            ui_fill(kx, ctl.y, kw, kh, bound ? 0x2F5CC8FFu : UI_HOVER, 5.0f);
+            ui_stroke(kx + 0.5f, ctl.y + 0.5f, kw - 1.0f, kh - 1.0f,
+                      bound ? UI_ACCENT : UI_LINE, 1.0f, 5.0f);
+            ui_text(bound ? L"PRESS KEY" : value, kx, ctl.y, kw, kh,
+                    bound ? UI_ACCENT : (hot ? UI_TEXT : UI_MUTED), g_fmt_key);
+            break;
+        }
+        case MK_NUMBER: {
+            const float f = menu_frac(row);
+            const int dragging = (g_menu_drag_row == row);
+            ui_fill(ctl.x, ctl.y, ctl.w, ctl.h, UI_HOVER, 5.0f);
+            if (f > 0.0f)
+                ui_fill(ctl.x, ctl.y, ctl.w * f, ctl.h,
+                        dragging ? 0x4A2A7FA6u : 0x332A7FA6u, 5.0f);
+            ui_stroke(ctl.x + 0.5f, ctl.y + 0.5f, ctl.w - 1.0f, ctl.h - 1.0f,
+                      dragging ? UI_ACCENT : (hot ? 0xFF2E4256u : UI_LINE),
+                      1.0f, 5.0f);
+            if (f > 0.0f)
+                ui_fill(ctl.x + 1.0f, ctl.y + ctl.h - 3.0f,
+                        (ctl.w - 2.0f) * f, 2.0f,
+                        dragging ? UI_ACCENT : 0x805CC8FFu, 1.0f);
+            ui_chevron(ctl.x + 12.0f, ctl.y + ctl.h * 0.5f, -1,
+                       hot || sel ? UI_TEXT : UI_MUTED);
+            ui_chevron(ctl.x + ctl.w - 12.0f, ctl.y + ctl.h * 0.5f, 1,
+                       hot || sel ? UI_TEXT : UI_MUTED);
+            ui_text(value, ctl.x + 22.0f, ctl.y, ctl.w - 44.0f, ctl.h,
+                    dragging ? UI_ACCENT : (hot || sel ? UI_TEXT : 0xFFB9C6D4u),
+                    g_fmt_uiv);
+            break;
+        }
+        case MK_CHOICE: {
+            ui_fill(ctl.x, ctl.y, ctl.w, ctl.h, UI_HOVER, 5.0f);
+            ui_stroke(ctl.x + 0.5f, ctl.y + 0.5f, ctl.w - 1.0f, ctl.h - 1.0f,
+                      hot ? 0xFF2E4256u : UI_LINE, 1.0f, 5.0f);
+            ui_chevron(ctl.x + 12.0f, ctl.y + ctl.h * 0.5f, -1,
+                       hot || sel ? UI_TEXT : UI_MUTED);
+            ui_chevron(ctl.x + ctl.w - 12.0f, ctl.y + ctl.h * 0.5f, 1,
+                       hot || sel ? UI_TEXT : UI_MUTED);
+            ui_text(value, ctl.x + 22.0f, ctl.y, ctl.w - 44.0f, ctl.h,
+                    hot || sel ? UI_TEXT : 0xFFB9C6D4u, g_fmt_uiv);
+            break;
+        }
+        default: break;
+        }
     }
 
-    /* Footer: the key hint, plus the live instant-lock numbers the aim worker
-     * learned on this machine (pixels per count and axis direction). Those two
-     * are what a wrong-sensitivity aim looks like from the outside. */
-    {
-        D2D1_RECT_F rf;
-        wchar_t hint[192];
-        if (g_menu_rebind) {
-            _snwprintf_s(hint, 192, _TRUNCATE, L"press a key - esc cancels");
+    /* Footer: key hints on the left, live aim calibration on the right. */
+    ui_line(g.content_x + g.pad, g.y + g.h - g.foot,
+            g.x + g.w - g.pad, g.y + g.h - g.foot, UI_LINE_SOFT, 1.0f);
+    if (g_menu_rebind) {
+        ui_text(L"PRESS ANY KEY", g.content_x + g.pad, g.y + g.h - g.foot,
+                g.content_w - g.pad * 2.0f, g.foot, UI_ACCENT, g_fmt_ui);
+        ui_text(L"ESC CANCELS", g.x + g.w - g.pad - 160.0f,
+                g.y + g.h - g.foot, 160.0f, g.foot, UI_MUTED, g_fmt_small_r);
+    } else {
+        wchar_t tele[128];
+        if (on_title || g_menu_win_drag) {
+            ui_text(L"HOLD LMB TO MOVE WINDOW", g.content_x + g.pad,
+                    g.y + g.h - g.foot, g.content_w * 0.52f, g.foot,
+                    UI_ACCENT, g_fmt_small);
         } else {
-            RR_AIM_FRAME af;
-            rr_aim_frame_stats(&af);
-            if (af.picked)
-                _snwprintf_s(hint, 192, _TRUNCATE,
-                             L"click a row  -  arrows + enter  -  pgup/pgdn tabs   "
-                             L"px %.2f,%.2f  sign %+d,%+d  err %.0f,%.0f",
-                             af.px_x, af.px_y, af.sign_x, af.sign_y, af.err_x, af.err_y);
-            else
-                _snwprintf_s(hint, 192, _TRUNCATE,
-                             L"click a row  -  arrows + enter  -  pgup/pgdn tabs");
+            wchar_t hint[128];
+            _snwprintf_s(hint, 128, _TRUNCATE,
+                         L"UP/DOWN  NAVIGATE    LEFT/RIGHT  ADJUST    ENTER  TOGGLE");
+            ui_text(hint, g.content_x + g.pad, g.y + g.h - g.foot,
+                    g.content_w * 0.52f, g.foot, UI_DIM, g_fmt_small);
         }
-        rf.left = g.x + g.pad; rf.top = g.y + g.h - 28.0f;
-        rf.right = g.x + g.w - g.pad; rf.bottom = g.y + g.h - 4.0f;
-        text_in(hint, rf, 0xFF7C8595, g_fmt_l);
+        rr_aim_frame_stats(&af);
+        if (af.picked)
+            _snwprintf_s(tele, 128, _TRUNCATE, L"DPC %.4f   AUTO CAL %d   N %d",
+                         (double)af.dpc, af.cal, af.cal_samples);
+        else
+            _snwprintf_s(tele, 128, _TRUNCATE, L"DPC %.4f   AUTO CAL %d",
+                         (double)af.dpc, af.cal);
+        ui_text(tele, g.x + g.w - g.pad - 220.0f, g.y + g.h - g.foot,
+                220.0f, g.foot, UI_DIM, g_fmt_small_r);
     }
 
     /* Painted pointer: the game hides the OS cursor, so without this the panel
-     * would take clicks from an invisible hand. */
-    {
-        float cx = 0.0f, cy = 0.0f;
-        if (menu_cursor(&cx, &cy) && cx >= 0.0f && cy >= 0.0f &&
-            cx <= W + 40.0f && cy <= H + 40.0f) {
-            g_brush->SetColor(col(0xFF39FF88, 1.0f));
-            g_d2d_ctx->DrawLine(D2D1::Point2F(cx - 9.0f, cy), D2D1::Point2F(cx - 2.5f, cy), g_brush, 1.6f);
-            g_d2d_ctx->DrawLine(D2D1::Point2F(cx + 2.5f, cy), D2D1::Point2F(cx + 9.0f, cy), g_brush, 1.6f);
-            g_d2d_ctx->DrawLine(D2D1::Point2F(cx, cy - 9.0f), D2D1::Point2F(cx, cy - 2.5f), g_brush, 1.6f);
-            g_d2d_ctx->DrawLine(D2D1::Point2F(cx, cy + 2.5f), D2D1::Point2F(cx, cy + 9.0f), g_brush, 1.6f);
-            g_d2d_ctx->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 2.2f, 2.2f), g_brush, 1.4f);
+     * would take clicks from an invisible hand. Over the drag strip it turns
+     * into a four-way move cursor so the handle is discoverable. */
+    if (have_cur && cur_x >= -4.0f && cur_y >= -4.0f &&
+        cur_x <= W + 40.0f && cur_y <= H + 40.0f) {
+        const float cx = cur_x, cy = cur_y;
+        if (on_title || g_menu_win_drag) {
+            const float r = 9.0f;
+            ui_line(cx - r, cy, cx + r, cy, 0x80000000u, 3.0f);
+            ui_line(cx, cy - r, cx, cy + r, 0x80000000u, 3.0f);
+            ui_line(cx - r, cy, cx + r, cy, UI_ACCENT, 1.5f);
+            ui_line(cx, cy - r, cx, cy + r, UI_ACCENT, 1.5f);
+            ui_line(cx - r, cy, cx - r + 4.0f, cy - 3.0f, UI_ACCENT, 1.4f);
+            ui_line(cx - r, cy, cx - r + 4.0f, cy + 3.0f, UI_ACCENT, 1.4f);
+            ui_line(cx + r, cy, cx + r - 4.0f, cy - 3.0f, UI_ACCENT, 1.4f);
+            ui_line(cx + r, cy, cx + r - 4.0f, cy + 3.0f, UI_ACCENT, 1.4f);
+            ui_line(cx, cy - r, cx - 3.0f, cy - r + 4.0f, UI_ACCENT, 1.4f);
+            ui_line(cx, cy - r, cx + 3.0f, cy - r + 4.0f, UI_ACCENT, 1.4f);
+            ui_line(cx, cy + r, cx - 3.0f, cy + r - 4.0f, UI_ACCENT, 1.4f);
+            ui_line(cx, cy + r, cx + 3.0f, cy + r - 4.0f, UI_ACCENT, 1.4f);
+        } else {
+            ui_line(cx - 10.0f, cy + 1.0f, cx - 3.0f, cy + 1.0f, 0x80000000u, 2.4f);
+            ui_line(cx - 10.0f, cy, cx - 3.0f, cy, UI_ACCENT, 1.6f);
+            ui_line(cx + 3.0f, cy, cx + 10.0f, cy, UI_ACCENT, 1.6f);
+            ui_line(cx, cy - 10.0f, cx, cy - 3.0f, UI_ACCENT, 1.6f);
+            ui_line(cx, cy + 3.0f, cx, cy + 10.0f, UI_ACCENT, 1.6f);
+            ui_fill(cx - 1.5f, cy - 1.5f, 3.0f, 3.0f, UI_ACCENT, 1.5f);
         }
     }
 }
@@ -1329,23 +2224,37 @@ static void draw_menu(float W, float H, int seen) {
 static void draw_skeleton(const RR_PLAYER* p, const RR_CAMERA* cam, int vw, int vh, UINT32 argb) {
     RR_V3 world[RR_MAX_BONES];
     float xy[RR_MAX_BONES * 2];
-    int nb = rr_bone_count();
+    const int palette = rr_bone_count();
+    int nb = p->nbones;
     int b;
 
+    if (nb < 2) return;
     if (nb > RR_MAX_BONES) nb = RR_MAX_BONES;
-    if (!p->nbones || nb < 2) return;
     memcpy(world, p->bone, sizeof(RR_V3) * (size_t)nb);
     game_w2s_many(cam, world, nb, vw, vh, xy);
     g_brush->SetColor(col(argb, 0.9f));
-    for (b = 0; b < nb; ++b) {
-        int par = rr_bone_parent(b);
-        float x, y, px, py;
-        if (par < 0 || par >= nb) continue;
-        if (!rr_bone_drawable(b) || !rr_bone_drawable(par)) continue;
-        x = xy[b * 2]; y = xy[b * 2 + 1];
-        px = xy[par * 2]; py = xy[par * 2 + 1];
-        if (!isfinite(x) || !isfinite(y) || !isfinite(px) || !isfinite(py)) continue;
-        g_d2d_ctx->DrawLine(D2D1::Point2F(px, py), D2D1::Point2F(x, y), g_brush, 1.1f);
+    /* The renderer palette is a branch tree; the seven-bone mesh fallback and
+     * the animated skeleton model are linear chains. Using the palette parent
+     * table for a chain draws the head to the wrong joint, and projecting
+     * joints past nbones (they stay zeroed) draws lines from the world origin. */
+    if (p->full_rig && nb == palette) {
+        for (b = 0; b < nb; ++b) {
+            int par = rr_bone_parent(b);
+            float x, y, px, py;
+            if (par < 0 || par >= nb) continue;
+            if (!rr_bone_drawable(b) || !rr_bone_drawable(par)) continue;
+            x = xy[b * 2]; y = xy[b * 2 + 1];
+            px = xy[par * 2]; py = xy[par * 2 + 1];
+            if (!isfinite(x) || !isfinite(y) || !isfinite(px) || !isfinite(py)) continue;
+            g_d2d_ctx->DrawLine(D2D1::Point2F(px, py), D2D1::Point2F(x, y), g_brush, 1.1f);
+        }
+    } else {
+        for (b = 0; b + 1 < nb; ++b) {
+            const float x = xy[b * 2], y = xy[b * 2 + 1];
+            const float px = xy[(b + 1) * 2], py = xy[(b + 1) * 2 + 1];
+            if (!isfinite(x) || !isfinite(y) || !isfinite(px) || !isfinite(py)) continue;
+            g_d2d_ctx->DrawLine(D2D1::Point2F(px, py), D2D1::Point2F(x, y), g_brush, 1.1f);
+        }
     }
 }
 
@@ -1488,7 +2397,7 @@ static void draw_radar(const RR_PLAYER* players, int n, const RR_CAMERA* cam,
         else rgb = color_for(p);
 
         g_brush->SetColor(col(rgb, 1.0f));
-        if (!p->is_loot && !p->is_vehicle && p->dead) {
+        if (!p->is_loot && !p->is_vehicle && (p->dead || p->health == 0)) {
             D2D1_ELLIPSE ring = D2D1::Ellipse(D2D1::Point2F(x, y), 3.0f, 3.0f);
             g_d2d_ctx->DrawEllipse(ring, g_brush, 1.4f);
         } else {
@@ -1741,7 +2650,7 @@ static void hud_sort(void) {
 static void hud_reserve_fixed(const RR_PLAYER* players, int n, float W, float H) {
     int i;
     if (g_menu_open) {
-        const MENU_GEO mg = menu_geo(H);
+        const MENU_GEO mg = menu_geo(W, H);
         hud_grid_mark(mg.x - 4.0f, mg.y - 4.0f, mg.w + 8.0f, mg.h + 8.0f);
     }
     if (!g_cfg.radar || g_cfg.radar_range <= 0) return;
@@ -1817,7 +2726,7 @@ static void hud_place_and_draw(const RR_PLAYER* players, int n, float W, float H
 }
 
 /* ---- target-filter panel -------------------------------------------------
- * Four independent switches drawn as sliding toggles in their own strip under
+ * Five independent switches drawn as sliding toggles in their own strip under
  * the main panel. Self-contained: its own geometry, its own hit test, its own
  * mouse edge. Nothing in the row table or the big switches is touched, so the
  * existing keyboard navigation keeps working unchanged.
@@ -1828,12 +2737,15 @@ static void hud_place_and_draw(const RR_PLAYER* players, int n, float W, float H
 
 typedef struct { float x, y, w, h; } IGN_RECT;
 
-static float g_ign_anim[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#define IGN_ROWS 5
+
+static float g_ign_anim[IGN_ROWS] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 static int   g_ign_lmb = 0;
 static DWORD g_ign_last = 0;
 
-static const wchar_t* const ign_name[4] = {
-    L"Ignore dead", L"Ignore prone", L"Ignore party", L"Ignore clan"
+static const wchar_t* const ign_name[IGN_ROWS] = {
+    L"Ignore dead", L"Ignore prone", L"Ignore party", L"Ignore clan",
+    L"Ignore civilian"
 };
 
 static int ign_value(int k) {
@@ -1842,6 +2754,7 @@ static int ign_value(int k) {
     case 1: return g_cfg.ign_prone;
     case 2: return g_cfg.ign_party;
     case 3: return g_cfg.ign_clan;
+    case 4: return g_cfg.ign_civilian;
     default: return 0;
     }
 }
@@ -1852,6 +2765,7 @@ static void ign_set(int k, int v) {
     case 1: g_cfg.ign_prone = v; break;
     case 2: g_cfg.ign_party = v; break;
     case 3: g_cfg.ign_clan  = v; break;
+    case 4: g_cfg.ign_civilian = v; break;
     default: break;
     }
 }
@@ -1861,7 +2775,7 @@ static void ign_set(int k, int v) {
 static IGN_RECT ign_strip(float W, float H) {
     IGN_RECT r;
     r.w = 300.0f;
-    r.h = 132.0f;
+    r.h = 34.0f + (float)IGN_ROWS * 24.0f + 8.0f;
     r.x = 24.0f;
     r.y = H - r.h - 24.0f;
     if (r.y < 24.0f) r.y = 24.0f;
@@ -1910,7 +2824,7 @@ static void ign_tick(float W, float H) {
     g_ign_lmb = down;
 
     if (edge && have) {
-        for (int k = 0; k < 4; ++k) {
+        for (int k = 0; k < IGN_ROWS; ++k) {
             /* Whole row is the click target, not just the pill: a 46x20 pill is
              * a small thing to hit while the game is running. */
             IGN_RECT row = s;
@@ -1931,7 +2845,7 @@ static void ign_tick(float W, float H) {
     g_ign_last = now;
     if (dt > 100.0f) dt = 100.0f;
     const float step = dt / 120.0f;
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < IGN_ROWS; ++k) {
         const float want = ign_value(k) ? 1.0f : 0.0f;
         if (g_ign_anim[k] < want) {
             g_ign_anim[k] += step;
@@ -1963,7 +2877,7 @@ static void ign_draw(float W, float H) {
         text_in(L"TARGET FILTERS", hr, 0xFF6FE3A8, g_fmt_l);
     }
 
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < IGN_ROWS; ++k) {
         const IGN_RECT p = ign_pill(s, k);
         const float t = g_ign_anim[k];
         IGN_RECT row = s;
@@ -2016,10 +2930,11 @@ static void ign_draw(float W, float H) {
 }
 
 /* ---- AIM panel -----------------------------------------------------------
- * Replaces the old AIM tab. Four controls only: enable, bone, FOV, smoothing,
- * plus nospread. No calibration: the magnet measures sensitivity itself. */
+ * Enable, bone, FOV, smoothing, nospread and the steering mode. Camera aim
+ * writes the game's own look rotation; mouse aim keeps the calibrated servo.
+ * Sensitivity calibrates itself in mouse mode; there is no manual control. */
 
-static float g_aim_anim[2] = { 0.0f, 0.0f };   /* enable, nospread toggles */
+static float g_aim_anim[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   /* enable, nospread, camera, legit */
 static int   g_aim_lmb = 0;
 static DWORD g_aim_last = 0;
 static int   g_aim_drag = -1;                  /* 0 = fov, 1 = smooth */
@@ -2033,7 +2948,7 @@ typedef struct { float x, y, w, h; } AIM_RECT;
 
 static AIM_RECT aim_panel(float W, float H) {
     AIM_RECT r;
-    r.w = 320.0f; r.h = 236.0f;
+    r.w = 320.0f; r.h = 266.0f;
     r.x = W - r.w - 24.0f;
     r.y = 24.0f;
     if (r.x < 8.0f) r.x = 8.0f;
@@ -2129,13 +3044,18 @@ static void aim_tick(float W, float H) {
     g_aim_lmb = down;
 
     if (have) {
-        /* rows: 0 enable, 1 bone, 2 fov, 3 smooth, 4 nospread */
+        /* rows: 0 enable, 1 bone, 2 fov, 3 smooth, 4 nospread, 5 camera aim,
+         * 6 legit mode */
         if (edge) {
             const AIM_RECT r0 = aim_row(s, 0);
             const AIM_RECT r1 = aim_row(s, 1);
             const AIM_RECT r4 = aim_row(s, 4);
+            const AIM_RECT r5 = aim_row(s, 5);
+            const AIM_RECT r6 = aim_row(s, 6);
             if (aim_hit(r0, mx, my)) { g_cfg.aim = !g_cfg.aim; cfg_apply(); cfg_save(); }
             else if (aim_hit(r4, mx, my)) { g_cfg.nospread = !g_cfg.nospread; cfg_apply(); cfg_save(); }
+            else if (aim_hit(r5, mx, my)) { g_cfg.aim_mode = !g_cfg.aim_mode; cfg_apply(); cfg_save(); }
+            else if (aim_hit(r6, mx, my)) { g_cfg.aim_legit = !g_cfg.aim_legit; cfg_apply(); cfg_save(); }
             else if (aim_hit(r1, mx, my)) {
                 /* left half cycles back, right half forward */
                 const int dir = (mx < r1.x + r1.w * 0.5f) ? -1 : 1;
@@ -2159,7 +3079,7 @@ static void aim_tick(float W, float H) {
             float f = (mx - t.x) / t.w;
             if (f < 0.0f) f = 0.0f;
             if (f > 1.0f) f = 1.0f;
-            if (g_aim_drag == 0) g_cfg.aim_fov = 1 + (int)(f * 179.0f);
+            if (g_aim_drag == 0) g_cfg.aim_fov = 10 + (int)(f * 290.0f + 0.5f);
             else                 g_cfg.aim_smooth = 1 + (int)(f * 99.0f);
             cfg_apply();
         }
@@ -2173,8 +3093,8 @@ static void aim_tick(float W, float H) {
     g_aim_last = now;
     if (dt > 100.0f) dt = 100.0f;
     const float step = dt / 120.0f;
-    const int want[2] = { g_cfg.aim, g_cfg.nospread };
-    for (int k = 0; k < 2; ++k) {
+    const int want[4] = { g_cfg.aim, g_cfg.nospread, g_cfg.aim_mode, g_cfg.aim_legit };
+    for (int k = 0; k < 4; ++k) {
         const float w = want[k] ? 1.0f : 0.0f;
         if (g_aim_anim[k] < w) { g_aim_anim[k] += step; if (g_aim_anim[k] > w) g_aim_anim[k] = w; }
         else if (g_aim_anim[k] > w) { g_aim_anim[k] -= step; if (g_aim_anim[k] < w) g_aim_anim[k] = w; }
@@ -2212,17 +3132,36 @@ static void aim_draw(float W, float H) {
         }
     }
 
-    aim_slider_draw(aim_row(s, 2), (float)(g_cfg.aim_fov - 1) / 179.0f,
-                    0x39D67F, L"FOV", g_cfg.aim_fov, L"\u00B0");
+    aim_slider_draw(aim_row(s, 2), (float)(g_cfg.aim_fov - 10) / 290.0f,
+                    0x39D67F, L"FOV", g_cfg.aim_fov, L"px");
     aim_slider_draw(aim_row(s, 3), (float)(g_cfg.aim_smooth - 1) / 99.0f,
                     0x39D67F, L"Smoothing", g_cfg.aim_smooth, L"%");
     aim_toggle_draw(aim_row(s, 4), L"No spread", g_aim_anim[1]);
+    aim_toggle_draw(aim_row(s, 5), L"Camera aim", g_aim_anim[2]);
+    aim_toggle_draw(aim_row(s, 6), L"Legit mode", g_aim_anim[3]);
 
     if (g_fmt_l) {
         D2D1_RECT_F fr = D2D1::RectF(s.x + 12.0f, s.y + s.h - 24.0f,
                                      s.x + s.w - 12.0f, s.y + s.h - 6.0f);
-        text_in(L"Sensitivity is measured automatically", fr, 0xFF5A646E, g_fmt_l);
+        text_in(g_cfg.aim_mode ? L"Camera aim: no mouse input used"
+                               : L"Sensitivity is measured automatically",
+                fr, 0xFF5A646E, g_fmt_l);
     }
+}
+
+/* The aim ring is a screen-space indicator and does not need a resolved
+ * camera. Drawing it before the camera gate keeps it visible on the loading
+ * screen and in the lobby, where the old code returned early and the ring
+ * silently disappeared even though the switch was on. */
+static void draw_fov_ring(float W, float H) {
+    if (!g_cfg.fov_circle || !g_brush || !g_d2d_ctx) return;
+    float radius = (float)g_cfg.aim_fov;
+    if (radius > H * 0.5f) radius = H * 0.5f;
+    if (radius < 4.0f) return;
+    g_brush->SetColor(col(0xB45CC8FF, 1.0f));
+    g_d2d_ctx->DrawEllipse(
+        D2D1::Ellipse(D2D1::Point2F(W * 0.5f, H * 0.5f), radius, radius),
+        g_brush, 1.2f);
 }
 
 static void draw_frame(IDXGISwapChain* swap) {
@@ -2266,9 +3205,14 @@ static void draw_frame(IDXGISwapChain* swap) {
      * position into that surface. */
     g_vw = W;
     g_vh = H;
-    if (!g_game_hwnd) {
+    /* The swapchain can be recreated on a resolution or fullscreen change; a
+     * stale handle would break cursor mapping, the aim foreground gate and the
+     * window filter. Re-read the output window and move the gate with it. */
+    {
         DXGI_SWAP_CHAIN_DESC sd;
-        if (SUCCEEDED(swap->GetDesc(&sd))) g_game_hwnd = sd.OutputWindow;
+        if (SUCCEEDED(swap->GetDesc(&sd)) && sd.OutputWindow &&
+            (sd.OutputWindow != g_game_hwnd || !IsWindow(g_game_hwnd)))
+            g_game_hwnd = sd.OutputWindow;
     }
 
     if (g_game_hwnd) rr_gate_install(g_game_hwnd);
@@ -2301,17 +3245,28 @@ static void draw_frame(IDXGISwapChain* swap) {
                 /* Magnet telemetry, throttled: the locked joint, the remaining angle,
          * what SendInput was asked for, and the sensitivity measured at runtime.
          * Six lines a second while the aim key is held. */
+        static int cam_hook_last = -2;
+        const int cam_hook = game_cam_hook_state();
+        if (cam_hook != cam_hook_last) {
+            cam_hook_last = cam_hook;
+            ilog("camera: hook=%d (%s)", cam_hook,
+                 cam_hook == 2 ? "camera aim applied" :
+                 cam_hook == 1 ? "hook installed, waiting for a target" :
+                 cam_hook < 0 ? "image mismatch; mouse aim fallback"
+                              : "not attempted yet");
+        }
         static unsigned aim_log_at;
         RR_AIM_FRAME af;
         rr_aim_frame_stats(&af);
         const unsigned now_frame = (unsigned)g_frames;
         if (af.picked && (now_frame - aim_log_at) >= 10) {
             aim_log_at = now_frame;
-            ilog("aim: id=%d bone=%d yaw=%.3f pitch=%.3f sent=%d,%d dpc=%.5f fov=%.1f",
-                 (int)af.id, af.bone,
+            ilog("aim: id=%d bone=%d cam=%d yaw=%.3f pitch=%.3f sent=%d,%d dpc=%.5f cal=%d n=%d lat=%d fov=%.1f",
+                 (int)af.id, af.bone, af.cam,
                  (double)af.yaw, (double)af.pitch,
                  af.sent_x, af.sent_y,
-                 (double)af.dpc, (double)af.fov);
+                 (double)af.dpc, af.cal, af.cal_samples, af.latency,
+                 (double)af.fov);
         }
         static int nospread_last = -1;
         const int nsw = rr_nospread_writes();
@@ -2324,11 +3279,8 @@ static void draw_frame(IDXGISwapChain* swap) {
     }
 
     if (!cam.valid) {
-        if (g_menu_open) {
-            draw_menu(W, H, shown);
-            ign_tick(W, H); ign_draw(W, H);
-            aim_tick(W, H); aim_draw(W, H);
-        }
+        draw_fov_ring(W, H);
+        if (g_menu_open) draw_menu(W, H, shown);
         g_d2d_ctx->EndDraw();
         return;
     }
@@ -2354,36 +3306,68 @@ static void draw_frame(IDXGISwapChain* swap) {
 
         for (i = 0; i < n && g_cfg.esp; ++i) {
             RR_PLAYER* p = &players[i];
-            float hx, hy, fx, fy, boxw, boxh;
+            RR_V3 top;
+            float hx, hy, fx, fy, boxw, boxh, bx, by;
             UINT32 rgb;
             const char* role_label;
 
-            if (!p->valid || p->dead || p->is_loot || p->is_vehicle || p->local) continue;
+            if (!p->valid || p->dead || p->health == 0 || p->is_loot || p->is_vehicle || p->local) continue;
             if (p->hidden_in_object == 1) continue;
             if (!isfinite(p->dist) || p->dist > maxm) continue;
             if (!rr_category_allowed(p->role, br->show_cops, br->show_robbers,
                                      br->show_civilians, br->show_prisoners,
                                      br->show_npcs)) continue;
 
-            if (!game_w2s(&cam, &p->head, (int)W, (int)H, &hx, &hy)) continue;
-            if (!game_w2s(&cam, &p->pos, (int)W, (int)H, &fx, &fy)) continue;
-            boxh = fy - hy;
-            /* A box shorter than its border is noise, and a box wider than a
-             * third of the screen means the camera is inside the body. */
-            if (!isfinite(boxh) || boxh < 7.0f) continue;
-            if (hx < -50.0f || hx > W + 50.0f) continue;
-            boxw = boxh * 0.42f;
-            if (boxw > W * 0.30f) continue;
+            /* A seated body is shorter than the standing estimate, and its rig
+             * may not have resolved on this frame. Keep the head inside the
+             * vehicle instead of floating a 1.75 m box above the roof. */
+            top = p->head;
+            if (p->inveh && !p->mesh_bones) {
+                top = p->pos;
+                top.y += 1.45f;
+            }
+            /* Project both anchors even when one is just outside the NDC
+             * window: game_w2s still writes finite screen coordinates, and a
+             * body clipped by the screen edge must not blink off entirely. */
+            hx = hy = fx = fy = NAN;
+            int head_ok = game_w2s(&cam, &top, (int)W, (int)H, &hx, &hy);
+            int feet_ok = game_w2s(&cam, &p->pos, (int)W, (int)H, &fx, &fy);
+            if ((!head_ok && !feet_ok) || !isfinite(hx) || !isfinite(hy) ||
+                !isfinite(fx) || !isfinite(fy)) continue;
+            boxh = fabsf(fy - hy);
+            if (!isfinite(boxh)) continue;
+            /* Far players are only a few pixels tall; the old 7 px floor hid
+             * them well before the configured range was reached. A 2 px floor
+             * keeps a 1.8 m body visible past 600 m at 1080p while the 5 px
+             * width floor keeps the marker a readable rectangle. */
+            if (boxh < 2.0f) boxh = 2.0f;
+            if (p->inveh && boxh > 420.0f) boxh = 420.0f;
+            bx = (fx + hx) * 0.5f;
+            by = fminf(fy, hy);
+            if (bx < -200.0f || bx > W + 200.0f ||
+                by < -200.0f || by > H + 200.0f) continue;
+            if (p->inveh) {
+                /* The body leans inside the cabin; cover the horizontal gap
+                 * between the feet and the head as well as the seated height. */
+                boxw = boxh * 1.30f + fabsf(hx - fx);
+            } else {
+                boxw = boxh * 0.42f;
+            }
+            /* A box wider than a third of the screen means the camera is inside
+             * a standing body. The seated box is deliberately wider (it covers
+             * the cabin), so it gets a looser guard; otherwise a player right
+             * next to the vehicle would be skipped at 720p. */
+            if (boxw > W * (p->inveh ? 0.85f : 0.30f)) continue;
             if (boxw < 5.0f) boxw = 5.0f;
 
             ++shown;
             rgb = color_for(p);
             if (g_cfg.boxes) {
                 D2D1_RECT_F r;
-                r.left = hx - boxw * 0.5f;
-                r.top = hy;
-                r.right = hx + boxw * 0.5f;
-                r.bottom = fy;
+                r.left = bx - boxw * 0.5f;
+                r.top = by;
+                r.right = bx + boxw * 0.5f;
+                r.bottom = by + boxh;
                 g_brush->SetColor(col(rgb, 1.0f));
                 g_d2d_ctx->DrawRectangle(r, g_brush, 1.6f);
             }
@@ -2393,19 +3377,19 @@ static void draw_frame(IDXGISwapChain* swap) {
             if (g_cfg.health && p->health >= 0) {
                 const float frac = rr_health_fraction(p->health);
                 D2D1_RECT_F bar;
-                bar.left = hx - boxw * 0.5f - 6.0f;
+                bar.left = bx - boxw * 0.5f - 6.0f;
                 bar.right = bar.left + 3.5f;
-                bar.top = hy;
-                bar.bottom = fy;
+                bar.top = by;
+                bar.bottom = by + boxh;
                 g_brush->SetColor(col(0x70000000, 1.0f));
                 g_d2d_ctx->FillRectangle(bar, g_brush);
                 g_brush->SetColor(col(rr_health_color(frac) | 0xFF000000u, 1.0f));
-                bar.top = fy - boxh * frac;
+                bar.top = by + boxh * (1.0f - frac);
                 g_d2d_ctx->FillRectangle(bar, g_brush);
                 if (p->armor > 0) {
                     bar.left = bar.right + 1.5f;
                     bar.right = bar.left + 3.0f;
-                    bar.top = hy;
+                    bar.top = by;
                     g_brush->SetColor(col(0xFF5AA0FF, 0.85f));
                     g_d2d_ctx->FillRectangle(bar, g_brush);
                 }
@@ -2442,7 +3426,7 @@ static void draw_frame(IDXGISwapChain* swap) {
                 else
                     _snwprintf_s(meta, 192, _TRUNCATE, L"%s%s%s", wrole, gap, wweap);
                 if (meta[0])
-                    hud_push((p->addr << 1) | 1u, meta, hx, fy + 2.0f, 300.0f,
+                    hud_push((p->addr << 1) | 1u, meta, bx, by + boxh + 2.0f, 300.0f,
                              floorf(p->dist) * 2.0f + 1.0f, 0xFFD8DEE9);
             }
         }
@@ -2450,15 +3434,14 @@ static void draw_frame(IDXGISwapChain* swap) {
 
     hud_place_and_draw(players, n, W, H);
 
+    /* Aim-assist capture ring. aim_fov is the pixel radius the picker uses, so
+     * the ring shows exactly the zone the aim can acquire from. It belongs to
+     * the visuals tab and stays visible whether aim is currently enabled. */
+    draw_fov_ring(W, H);
+
     if (g_cfg.radar) draw_radar(players, n, &cam, W, H);
 
-    if (g_menu_open) {
-        draw_menu(W, H, shown);
-        ign_tick(W, H);
-        ign_draw(W, H);
-        aim_tick(W, H);
-        aim_draw(W, H);
-    }
+    if (g_menu_open) draw_menu(W, H, shown);
 
     g_d2d_ctx->EndDraw();
 }
@@ -2469,6 +3452,26 @@ static void draw_frame(IDXGISwapChain* swap) {
 static void maint_tick(void);
 
 static void on_present(IDXGISwapChain* swap) {
+    /* Collision snapshots are captured on this thread: a thread created inside
+     * the protected game is killed before it runs. The pump keeps its own
+     * 200/500/3000 ms capture cadence, so 40 ms here only refreshes the source
+     * pointer and publishes the readiness state. */
+    {
+        static DWORD last_los;
+        DWORD now = GetTickCount();
+        if (!last_los || now - last_los >= 40) {
+            last_los = now;
+            __try {
+                rr_los_pump();
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                static DWORD last_log;
+                if (!last_log || GetTickCount() - last_log >= 5000) {
+                    last_log = GetTickCount();
+                    ilog("los: exception 0x%08lX", GetExceptionCode());
+                }
+            }
+        }
+    }
     __try {
         g_swap = swap;
         draw_frame(swap);
@@ -2765,21 +3768,21 @@ static void init_once(void) {
     rr_force_pid(GetCurrentProcessId());
     rr_attach("ROB RUN.exe");
     raw_mark("init: rr_attach done");
-    /* The reader layer opens the device lazily, but nothing in this module calls
-     * a read before game_init decides where to look: open it once here so the
-     * first discovery pass runs on the kernel transport instead of falling
-     * through to a user-mode handle the anti-cheat may refuse. */
-    rr_drv_open();
+    /* The payload is already inside the game, so its transport is the process
+     * itself: direct guarded copies, no device and no handle. This deliberately
+     * never probes \Device\WmPort or HKLM\SYSTEM\WmPort, so a driver left over
+     * from an older launcher is neither used nor touched by this image. */
+    rr_drv_open_self();
     ilog("transport: %s pid=%u", rr_transport(), (unsigned)g_rr_pid);
     cfg_load();
     raw_mark("init: config loaded");
     ilog("cfg: esp=%d boxes=%d names=%d skel=%d health=%d dist=%d range=%d "
-         "aim=%d aimkey=%d fov=%d smooth=%d bone=%d aimdist=%d trig=%d recoil=%d "
+         "aim=%d aimkey=%d fov=%d smooth=%d bone=%d aimdist=%d aimmode=%d trig=%d recoil=%d "
          "aa=%d aamode=%d aaspd=%d aarange=%d aakey=%d "
          "menu_key=%d insert_key=%d",
          g_cfg.esp, g_cfg.boxes, g_cfg.names, g_cfg.skeleton, g_cfg.health,
          g_cfg.distance, g_cfg.max_dist, g_cfg.aim, g_cfg.aim_key, g_cfg.aim_fov,
-         g_cfg.aim_smooth, g_cfg.aim_bone, g_cfg.aim_dist, g_cfg.trigger,
+         g_cfg.aim_smooth, g_cfg.aim_bone, g_cfg.aim_dist, g_cfg.aim_mode, g_cfg.trigger,
          g_cfg.norecoil, g_cfg.aa, g_cfg.aa_mode, g_cfg.aa_speed, g_cfg.aa_range,
          g_cfg.aa_key, g_cfg.menu_key, g_cfg.insert_key);
     ilog("cfg: radar=%d range=%d radarloot=%d | loot=%d nodes=%d cont=%d doors=%d "
@@ -2788,6 +3791,9 @@ static void init_once(void) {
          g_cfg.loot_nodes, g_cfg.containers, g_cfg.doors, g_cfg.dropped,
          g_cfg.vehicle_loot, g_cfg.prices, g_cfg.autoloot,
          g_cfg.autoloot_range, g_cfg.autoloot_key);
+    ilog("cfg: ignore dead=%d prone=%d party=%d clan=%d civilian=%d",
+         g_cfg.ign_dead, g_cfg.ign_prone, g_cfg.ign_party, g_cfg.ign_clan,
+         g_cfg.ign_civilian);
     /* Hooking first: game_init walks the heap for seconds, and nothing draws
      * until Present is ours. */
     for (i = 0; i < 20 && !g_hooked; ++i) {
@@ -2831,8 +3837,8 @@ static void maint_tick(void) {
     }
 
     now = GetTickCount();
+    /* Re-assert the panel state after a window change; a no-op otherwise. */
     rr_gate_set_open(g_menu_open);
-    rr_gate_pump();
     if (now - g_last_key_poll >= 20) {
         int key;
         g_last_key_poll = now;

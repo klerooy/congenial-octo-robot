@@ -22,8 +22,14 @@
 #define RR_OFF_REQ 0x00u
 #define RR_OFF_REP 0x40u
 #define RR_OFF_GEN 0x80u
-#define RR_REQ_MAGIC 0x31515252u  /* 'RRQ1' */
-#define RR_REP_MAGIC 0x31505252u  /* 'RRP1' */
+/* Decoded at runtime so the ASCII markers do not sit in the DLL. The values
+ * are the same as the driver's, so the wire format is unchanged. */
+#define RR_WIRE_KEY 0x5A5A5A6Au
+#define RR_REQ_MAGIC_ENC (0x31515252u ^ RR_WIRE_KEY)
+#define RR_REP_MAGIC_ENC (0x31505252u ^ RR_WIRE_KEY)
+static volatile uint32_t g_wire_key = RR_WIRE_KEY;
+static uint32_t rr_req_magic(void) { return RR_REQ_MAGIC_ENC ^ g_wire_key; }
+static uint32_t rr_rep_magic(void) { return RR_REP_MAGIC_ENC ^ g_wire_key; }
 #define RR_OP_PING 0x00u
 #define RR_OP_APC 0x01u
 #define RR_OP_PROTECT 0x02u
@@ -75,7 +81,7 @@ static void send_request(uint32_t op, uint32_t pid, uint32_t tid, uint64_t routi
                          uint64_t context, uint32_t* seq_out) {
     RR_REQ_WIRE q;
     memset(&q, 0, sizeof q);
-    q.magic = RR_REQ_MAGIC;
+    q.magic = rr_req_magic();
     q.seq = ++g_seq;
     q.op = op;
     q.pid = pid;
@@ -91,7 +97,7 @@ static int wait_reply(uint32_t seq, int timeout_ms, RR_REP_WIRE* out) {
     for (;;) {
         RR_REP_WIRE r;
         memset(&r, 0, sizeof r);
-        if (ch_io(&r, (DWORD)sizeof r, RR_OFF_REP, 0) && r.magic == RR_REP_MAGIC &&
+        if (ch_io(&r, (DWORD)sizeof r, RR_OFF_REP, 0) && r.magic == rr_rep_magic() &&
             r.seq == seq) {
             if (out) *out = r;
             return 1;

@@ -535,7 +535,8 @@ body[data-preview="1"] #preview{display:inline-block}
               <label class="row"><span>Rage<small>Key-free, whole-screen engagement with autofire</small></span><input type="checkbox" id="rage" data-key="rage"><i class="sw"></i></label>
               <label class="row"><span>Require fire held<small>Only steer while the mouse button is down</small></span><input type="checkbox" data-key="aim_require_fire"><i class="sw"></i></label>
               <label class="row"><span>Draw FOV circle</span><input type="checkbox" data-key="aa_show_fov" checked><i class="sw"></i></label>
-              <label class="row"><span>Visible only<small>Skip targets behind collision geometry</small></span><input type="checkbox" data-key="aa_los_on"><i class="sw"></i></label>
+              <label class="row"><span>Visible only<small>Skip targets behind collision geometry</small></span><input type="checkbox" data-key="aa_los_on" checked><i class="sw"></i></label>
+              <label class="row"><span>Legit mode<small>Reaction window, bounded turn rate and line of sight</small></span><input type="checkbox" data-key="aim_legit" checked><i class="sw"></i></label>
               <label class="row"><span>Closest target first</span><input type="checkbox" data-key="aa_closest_first"><i class="sw"></i></label>
               <label class="row"><span>Target clan members</span><input type="checkbox" data-key="aim_targets" data-bit="1"><i class="sw"></i></label>
               <label class="row"><span>Target police coworkers</span><input type="checkbox" data-key="aim_targets" data-bit="2"><i class="sw"></i></label>
@@ -570,6 +571,17 @@ body[data-preview="1"] #preview{display:inline-block}
               <label class="srow"><span class="top"><span>Smoothing</span><output></output></span><input type="range" id="aim_smooth" min="1" max="100" step="1" value="30" data-key="aim_smooth" data-unit="%"></label>
               <label class="srow"><span class="top"><span>Aim range</span><output></output></span><input type="range" min="0" max="1000" step="10" value="0" data-key="aa_dist" data-unit=" m"></label>
             </div>
+          </article>
+          <article class="card">
+            <h2>Humanization</h2>
+            <div class="rows">
+              <label class="row"><span>Humanize<small>Bounded wobble around the selected joint</small></span><input type="checkbox" data-key="aim_humanize"><i class="sw"></i></label>
+              <label class="srow"><span class="top"><span>Strength</span><output></output></span><input type="range" min="0" max="100" step="1" value="35" data-key="aim_humanize_strength" data-unit="%"></label>
+              <label class="srow"><span class="top"><span>Speed</span><output></output></span><input type="range" min="1" max="100" step="1" value="50" data-key="aim_humanize_speed" data-unit="%"></label>
+              <label class="row"><span>Randomize bones<small>Change the aimed joint inside the selected group</small></span><input type="checkbox" data-key="aim_bone_random"><i class="sw"></i></label>
+              <label class="srow"><span class="top"><span>Bone change interval</span><output></output></span><input type="range" min="50" max="2000" step="50" value="350" data-key="aim_bone_interval" data-unit=" ms"></label>
+            </div>
+            <p>Humanize adds a smooth, seeded wobble that never leaves the target body. Bone randomization picks a stable joint inside the selected group; the interval controls how often it changes, so the aim does not hop every frame.</p>
           </article>
           <article class="card">
             <h2>TriggerBot</h2>

@@ -59,7 +59,10 @@ long rr_stat_calls(void) { return g_calls; }
 long rr_stat_bytes(void) { return g_bytes; }
 void rr_stat_reset(void) { g_calls = 0; g_bytes = 0; }
 
-/* Device. */
+/* Device.  The internal payload is compiled with RR_SELF_ONLY, so this whole
+ * block - including the \Device\WmPort and SYSTEM\WmPort names - is absent from
+ * rr_int.dll.  The external overlay still compiles it. */
+#ifndef RR_SELF_ONLY
 
 static int open_device(void) {
     HMODULE nd = GetModuleHandleW(L"ntdll.dll");
@@ -151,6 +154,8 @@ static int verify_key(ULONG key) {
     return st >= 0 && ios.Information == sizeof(out) && out == probe;
 }
 
+#endif /* !RR_SELF_ONLY */
+
 /* User-mode fallback.
  *
  * On a clean boot an unsigned driver cannot load at all, and when Easy
@@ -165,9 +170,64 @@ static int verify_key(ULONG key) {
  * same answer a caller gets from a closed device. */
 static HANDLE   g_uproc = NULL;
 static uint32_t g_upid  = 0;
-static int      g_mode  = 0;   /* 0 none, 1 device, 2 user */
+static int      g_mode  = 0;   /* 0 none, 1 device, 2 user, 3 self */
+static int      g_self  = 0;   /* direct in-process access, no driver */
+
+/* In-process reads are a plain copy with an access-violation guard. This is the
+ * path the internal payload uses: no device, no process handle, no IOCTL. */
+static int self_read(uint64_t addr, void* out, size_t n) {
+    if (!addr || !out) return 0;
+    __try {
+        memcpy(out, (const void*)(uintptr_t)addr, n);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    g_calls++;
+    g_bytes += (long)n;
+    (*ok_cell()) = 1;
+    return 1;
+}
+
+static int self_write_raw(uint64_t addr, const void* in, size_t n) {
+    __try {
+        memcpy((void*)(uintptr_t)addr, in, n);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return 1;
+}
+
+static int self_write(uint64_t addr, const void* in, size_t n) {
+    DWORD old = 0;
+    DWORD want = PAGE_READWRITE;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!addr || !in) return 0;
+    if (!self_write_raw(addr, in, n)) {
+        /* Keep execute permission while the page is writable: a code patch is
+         * applied while the game's other threads are still running. */
+        if (VirtualQuery((const void*)(uintptr_t)addr, &mbi, sizeof mbi) &&
+            (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+            want = PAGE_EXECUTE_READWRITE;
+        if (!VirtualProtect((void*)(uintptr_t)addr, n, want, &old)) return 0;
+        if (!self_write_raw(addr, in, n)) {
+            VirtualProtect((void*)(uintptr_t)addr, n, old, &old);
+            return 0;
+        }
+        VirtualProtect((void*)(uintptr_t)addr, n, old, &old);
+    }
+    g_calls++;
+    g_bytes += (long)n;
+    return 1;
+}
 
 static int user_open(uint32_t pid) {
+    if (pid == GetCurrentProcessId()) {
+        if (g_uproc && g_uproc != GetCurrentProcess()) CloseHandle(g_uproc);
+        g_uproc = GetCurrentProcess();
+        g_upid = pid;
+        return 1;
+    }
     if (g_uproc && g_upid == pid) return 1;
     if (g_uproc) { CloseHandle(g_uproc); g_uproc = NULL; g_upid = 0; }
     if (!pid || pid == 4) return 0;
@@ -180,6 +240,27 @@ static int user_open(uint32_t pid) {
     return 1;
 }
 
+/* The internal payload is already inside the game. It needs no device and no
+ * process handle: every read and write is a direct copy on the current thread.
+ * This entry point deliberately does not probe \Device\WmPort or the registry,
+ * so a driver left over from an older launcher is neither used nor touched. */
+int rr_drv_open_self(void) {
+    if (g_dev) { CloseHandle(g_dev); g_dev = NULL; }
+    if (g_uproc && g_uproc != GetCurrentProcess()) CloseHandle(g_uproc);
+    g_uproc = NULL;
+    g_upid = 0;
+    g_pdioc = NULL;
+    g_drvkey = 0;
+    g_peb = 0;
+    g_self = 1;
+    g_mode = 3;
+    g_rr_pid = GetCurrentProcessId();
+    return 1;
+}
+
+#ifdef RR_SELF_ONLY
+int rr_drv_open(void) { return rr_drv_open_self(); }
+#else
 int rr_drv_open(void) {
     if (g_dev && g_pdioc && g_drvkey) { g_mode = 1; return 1; }  /* already open */
     if (!open_device()) {
@@ -203,21 +284,26 @@ int rr_drv_open(void) {
         g_drvkey = derived;
     return 1;
 }
+#endif
 
 void rr_drv_close(void) {
     if (g_dev) { CloseHandle(g_dev); g_dev = NULL; }
-    if (g_uproc) { CloseHandle(g_uproc); g_uproc = NULL; g_upid = 0; }
+    if (g_uproc && g_uproc != GetCurrentProcess()) CloseHandle(g_uproc);
+    g_uproc = NULL;
+    g_upid = 0;
     g_pdioc = NULL;
     g_peb = 0;
+    g_self = 0;
     (*ok_cell()) = 0;
     g_mode = 0;
 }
 
 int rr_drv_live(void) { return (*ok_cell()); }
 
-int rr_drv_ready(void) { return (g_dev && g_pdioc && g_drvkey) ? 1 : (g_mode == 2); }
+int rr_drv_ready(void) { return (g_self || (g_dev && g_pdioc && g_drvkey) || g_mode == 2) ? 1 : 0; }
 
 const char* rr_transport(void) {
+    if (g_self) return "self";
     if (g_dev && g_pdioc && g_drvkey) return "device";
     return g_mode == 2 ? "user" : "none";
 }
@@ -268,7 +354,16 @@ int rr_drv_alloc_remote(uint32_t pid, size_t size, uint32_t protect, uint64_t* o
     if (out) *out = 0;
     if (!pid || size == 0 || size > 0x2000000u) return 0;
     if (!out) return 0;
+#ifdef RR_SELF_ONLY
+    if (pid != GetCurrentProcessId()) return 0;
+#endif
 
+    if (g_self && pid == GetCurrentProcessId()) {
+        void* p = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, (DWORD)protect);
+        if (!p) return 0;
+        *out = (uint64_t)(ULONG_PTR)p;
+        return 1;
+    }
     if (!g_dev || !g_pdioc) {
         if (!user_open(pid)) return 0;
         void* p = VirtualAllocEx(g_uproc, NULL, size, MEM_COMMIT | MEM_RESERVE, (DWORD)protect);
@@ -335,6 +430,17 @@ long rr_drv_get_context(uint32_t thread_id, RR_THREAD_CTX* out) {
 }
 
 int rr_query_region(uint64_t addr, RR_REGION* out) {
+    if (!out) return 0;
+    if (g_self) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((LPCVOID)(ULONG_PTR)addr, &mbi, sizeof(mbi))) return 0;
+        out->state = (uint32_t)mbi.State;
+        out->protect = (uint32_t)mbi.Protect;
+        out->type = (uint32_t)mbi.Type;
+        out->base = (uint64_t)(ULONG_PTR)mbi.BaseAddress;
+        out->size = (uint64_t)mbi.RegionSize;
+        return 1;
+    }
     if (!g_dev || !g_pdioc || !out) {
         MEMORY_BASIC_INFORMATION mbi;
         if (!out || !user_open(g_rr_pid)) return 0;
@@ -482,6 +588,14 @@ int rr_read(uint64_t addr, void* out, size_t n) {
 
 int rr_read_pid(uint32_t pid, uint64_t addr, void* out, size_t n) {
     if (!out || n == 0 || n > 0x10000u) return 0;
+#ifdef RR_SELF_ONLY
+    /* This image only ever reads the process it is mapped into. Refuse any
+     * other pid instead of falling back to a Win32 handle on a live target. */
+    if (pid != GetCurrentProcessId()) return 0;
+#endif
+    /* Self transport: the payload already runs in the target, so a read is a
+     * guarded copy on this thread. No handle is opened and no IOCTL is sent. */
+    if (g_self && pid == GetCurrentProcessId()) return self_read(addr, out, n);
     if (g_dev && g_pdioc) {
         DRVCMD c;
         c.key = g_drvkey;
@@ -516,6 +630,10 @@ int rr_write(uint64_t addr, const void* in, size_t n) {
 
 int rr_write_pid(uint32_t pid, uint64_t addr, const void* in, size_t n) {
     if (!in || n == 0 || n > 0x10000u) return 0;
+#ifdef RR_SELF_ONLY
+    if (pid != GetCurrentProcessId()) return 0;
+#endif
+    if (g_self && pid == GetCurrentProcessId()) return self_write(addr, in, n);
     if (!g_dev || !g_pdioc) {
         if (!user_open(pid)) return 0;
         {
@@ -630,6 +748,13 @@ uint64_t rr_image_base(void) {
 uint64_t rr_peb(void) {
     uint64_t b = 0;
     if (g_peb) return g_peb;
+#ifdef RR_SELF_ONLY
+    /* In self mode the PEB is on this thread; no handle and no query is needed. */
+    if (g_self) {
+        g_peb = (uint64_t)(ULONG_PTR)NtCurrentTeb()->ProcessEnvironmentBlock;
+        return g_peb;
+    }
+#endif
     if (!g_dev || !g_pdioc) {
         typedef NTSTATUS (NTAPI* fQIP)(HANDLE, ULONG, PVOID, ULONG, PULONG);
         fQIP q = (fQIP)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");

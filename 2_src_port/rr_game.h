@@ -95,6 +95,9 @@ typedef struct RR_PLAYER {
     int32_t  id;
     RR_V3    pos;                  /* feet                                  */
     RR_V3    head;                 /* Resolved head joint or estimated head position. */
+    RR_V3    vel;                  /* replicated root velocity, metres/second */
+    int      vel_valid;            /* vel is recent enough to lead with       */
+    unsigned lead_ms;              /* ms already added to pos/head above      */
     float    dist;                 /* metres from the camera                */
     float    rot_yaw;              /* yaw, degrees                          */
     int      dead;
@@ -111,7 +114,8 @@ typedef struct RR_PLAYER {
     int      is_npc;
     int      armor;                /* -1 unknown, 0 none, 1 has armour       */
     int      crouch;               /* -1 unknown, 0 standing, 1 crouched     */
-    int      prone; 
+    int      prone;                /* 1 = on the ground or knocked out       */
+    int      knocked;              /* 1 = KnockoutPhase is KnockedOut        */
     char     role[20];             /* PlayerRoleDescription.Name            */
     char     weapon[20];           /* WeaponDescription.Name (dp9_m1, ...)   */
     char     name[RR_NAME_MAX];
@@ -185,6 +189,15 @@ int  game_calibrate(void);
  */
 int  game_snapshot(RR_PLAYER* out, int max, RR_CAMERA* cam);
 int  game_refresh_render_camera(RR_CAMERA* cam);
+/* Camera lock: point the game's own rotation input and the Cinemachine camera
+ * at a world point. Returns 0 when the current GameAssembly image does not
+ * match the verified camera-hook build; the caller then keeps the mouse path. */
+int  game_cam_track(const RR_CAMERA* cam, uint64_t target_id, RR_V3 target,
+                    int smooth, int max_dps);
+void game_cam_clear(void);
+/* 0 = not attempted yet, 1 = push hook installed, 2 = installed and applied,
+ * -1 = image mismatch. */
+int  game_cam_hook_state(void);
 int  game_discovery_active(void);
 #ifdef RR_PORT_DIAGNOSTICS
 int  game_is_aiming(void);

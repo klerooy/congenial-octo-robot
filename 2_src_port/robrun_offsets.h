@@ -81,8 +81,20 @@
 /* === SKELETON OFFSETS (VERIFIED FROM 03_Skeleton.cs) === */
 #define RR_OFF_CHAR_SKELETON        0x138u  /* SkeletonModel */
 #define RR_OFF_CHAR_INVEH           0x1C8u  /* InVehicleModel */
+#define RR_OFF_CHAR_KNOCKOUT        0x298u  /* KnockoutModel */
 #define RR_OFF_INVEH_ID             0x10u   /* _entityId */
 #define RR_OFF_INVEH_TYPE           0x20u   /* _vehicleType */
+
+/* Knockout state, verified against metadata v39. The replicated common data
+ * carries both the end timestamp and the phase reference; the phase is a
+ * pointer to one of two static enum items. DelayAfterRevive is a short
+ * post-revive phase, so only the KnockedOut item counts as down. */
+#define RR_OFF_COMMON_KNOCKOUT_END_TS 0x158u /* BattleCharacterCommonData.KnockoutEndTs */
+#define RR_OFF_COMMON_KNOCKOUT_PHASE  0x160u /* BattleCharacterCommonData.KnockoutPhase */
+#define RR_OFF_KNOCKOUT_END_TS        0x10u  /* KnockoutModel._endTs */
+#define RR_OFF_KNOCKOUT_PHASE         0x18u  /* KnockoutModel._knockoutPhase */
+#define RR_OFF_KNOCKED_OUT_STATIC     0x08u  /* KnockoutPhaseDescription.<KnockedOut> */
+#define RR_OFF_IDENTIFIED_ID          0x10u  /* Framework.Core.Identified.Identified.<Id> */
 
 /* === STATIC FIELD GLOBALS (UNCHANGED) === */
 #define RR_SF_WORLDMODEL            0x81D36C8u

@@ -1267,6 +1267,9 @@ static int run_selftest(void) {
     written.loot_tier_none = written.loot_tier_uncommon = written.loot_tier_epic = written.loot_tier_exotic = 1;
     written.aim_key = VK_RBUTTON;
     written.aim_enabled = 1; written.aim_fov = 100; written.aim_smooth = 30;
+    written.aim_humanize = 1; written.aim_humanize_strength = 65;
+    written.aim_humanize_speed = 85;
+    written.aim_bone_random = 1; written.aim_bone_interval = 500;
     written.aim_targets = RR_REL_CLAN;
     written.trigger_enabled = 1; written.trigger_key = 0; written.trigger_delay = 80;
     written.trigger_fov = 24; written.trigger_los = 0;
@@ -1297,6 +1300,10 @@ static int run_selftest(void) {
           loaded.trigger_fov == 24 && loaded.trigger_los == 0 &&
           loaded.show_spread_visualizer == 1,
           "config round trip saves aim, trigger and spread settings");
+    check(loaded.aim_humanize == 1 && loaded.aim_humanize_strength == 65 &&
+          loaded.aim_humanize_speed == 85 && loaded.aim_bone_random == 1 &&
+          loaded.aim_bone_interval == 500,
+          "config round trip saves humanize and bone randomization settings");
     check(loaded.show_npcs == 1 && loaded.show_prisoners == 1 && loaded.esp_weapon_icon == 1 &&
           loaded.esp_role_label == 1 && loaded.esp_text_distance == 0 && loaded.line_w == 2,
           "ESP icon, category, thickness and unlimited text settings round trip");

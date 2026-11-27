@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 #define BR_MAGIC 0x57444D31u
-#define BR_VERSION 24u
+#define BR_VERSION 27u
 #define BR_COLOR_COUNT 15
 
 /* Shared schema for the WebView, defaults and on-disk settings.
@@ -58,7 +58,12 @@ extern "C" {
     X(trigger_targets, 0, 0, 7) \
     X(show_spread_visualizer, 0, 0, 1) \
     X(aa_bone, 0, 0, 9) \
-    X(aa_los_on, 0, 0, 1) \
+    X(aim_humanize, 0, 0, 1) \
+    X(aim_humanize_strength, 35, 0, 100) \
+    X(aim_humanize_speed, 50, 1, 100) \
+    X(aim_bone_random, 0, 0, 1) \
+    X(aim_bone_interval, 350, 50, 2000) \
+    X(aa_los_on, 1, 0, 1) \
     X(aa_closest_first, 0, 0, 1) \
     X(aim_require_fire, 0, 0, 1) \
     X(trigger_head_only, 0, 0, 1) \
@@ -104,7 +109,9 @@ extern "C" {
     X(aim_ignore_dead, 1, 0, 1) \
     X(aim_ignore_prone, 0, 0, 1) \
     X(aim_ignore_party, 1, 0, 1) \
-    X(aim_ignore_clan, 1, 0, 1)
+    X(aim_ignore_clan, 1, 0, 1) \
+    X(aim_ignore_civilian, 0, 0, 1) \
+    X(aim_legit, 1, 0, 1)
 
 typedef struct BR_Config {
     unsigned int magic, version;

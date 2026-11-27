@@ -237,6 +237,7 @@ typedef struct {
     int32_t  id;
     int64_t  public_id;
     int      armor, crouch, local, is_npc, in_party;
+    int      knocked;
     int      inveh, vehicle_id;
     float    dist;
     char     role[20];
@@ -1896,6 +1897,28 @@ static uint64_t sim_for_server(uint64_t server) {
     return 0;
 }
 
+/* The replicated phase is a reference to one of two static enum items.
+ * Compare against <KnockedOut> instead of accepting any phase: after a revive
+ * the model stays in DelayAfterRevive for a short time while the player is
+ * already back on their feet. Static fields are the primary source; the enum
+ * item id is the fallback while the class is still initializing. */
+static int knockout_phase_is_knocked(uint64_t common) {
+    uint64_t data = rr_u64(common + RR_OFF_COMMON_KNOCKOUT_PHASE);
+    if (!PL(data)) return 0;
+    uint64_t item = rr_u64(data + RR_OFF_PRIM_VALUE);
+    if (!PL(item)) return 0;
+    uint64_t statics = u_static_fields(u_klass(item));
+    if (PL(statics)) {
+        uint64_t knocked = rr_u64(statics + RR_OFF_KNOCKED_OUT_STATIC);
+        if (PL(knocked)) return item == knocked;
+    }
+    char id[32];
+    uint64_t str = rr_u64(item + RR_OFF_IDENTIFIED_ID);
+    if (PL(str) && u_string(str, id, sizeof(id)))
+        return strcmp(id, "KnockedOut") == 0;
+    return 0;
+}
+
 static void fill_entry(ENT_CACHE* c, uint64_t p) {
     memset(c, 0, sizeof(*c));
     c->obj = p;
@@ -1953,6 +1976,7 @@ static void fill_entry(ENT_CACHE* c, uint64_t p) {
              * that would otherwise appear as stationary markers.
              */
             if (!c->role[0]) { c->obj = 0; return; }
+            c->knocked = knockout_phase_is_knocked(common);
             /* The item in hands is replicated for remote characters. */
             ref = rr_u64(common + RR_OFF_COMMON_ITEM_IN_HANDS);
             desc = PL(ref) ? rr_u64(ref + RR_OFF_REF_VALUE) : 0;
@@ -4324,6 +4348,352 @@ int game_refresh_render_camera(RR_CAMERA* cam) {
     return 1;
 }
 
+/* ---- camera lock --------------------------------------------------------
+ * The mouse aim steers through SendInput, so every correction carries the
+ * game's input smoothing and the user's sensitivity. The camera lock instead
+ * writes the game's own rotation input and applies the final look-at rotation
+ * to the Cinemachine camera state in ProcessActiveCamera. That removes the
+ * servo lag, the sensitivity estimate and the per-frame overshoot: the view
+ * points at the selected joint on the frame it is rendered.
+ *
+ * The payload runs with rr_set_no_threads(1), so there is no 1 kHz writer.
+ * The Present hook feeds the target once per frame; the camera push hook and
+ * the synchronous rotation write below carry it into the game before the next
+ * shot. install_camera_push() verifies the exact GameAssembly image first, and
+ * every caller falls back to the mouse path when the hook is unavailable.
+ */
+#include "rr_cam_offsets.h"
+
+typedef void (*RR_PUSH_CAMERA)(uint64_t, void*, void*);
+typedef void (*RR_SET_ROTATION)(uint64_t, float, float, float, void*);
+typedef void (*RR_SET_LOOK)(uint64_t, uint64_t, void*);
+
+static SRWLOCK g_camera_state_lock = SRWLOCK_INIT;
+static RR_V3 g_camera_target;
+static DWORD g_camera_target_at;
+static uint64_t g_camera_target_model;
+static uint64_t g_camera_target_id, g_camera_target_world;
+static int g_camera_smooth;
+/* Zero disables the cap; legit mode passes a finite degrees-per-second value. */
+static int g_camera_max_dps;
+
+static uint64_t cl_brain(void) {
+    const uint64_t aim = g_aim_updater;
+    if (!PL(aim)) return 0;
+    const uint64_t brain = rr_u64(aim + RR_OFF_AIM_BRAIN);
+    return PL(brain) && class_named(rr_u64(brain), "CinemachineBrain") ? brain : 0;
+}
+
+static RR_Q4 camera_look(float yaw, float pitch) {
+    const float cy = cosf(yaw * 0.5f), sy = sinf(yaw * 0.5f);
+    const float cp = cosf(pitch * 0.5f), sp = sinf(pitch * 0.5f);
+    return (RR_Q4){cy*sp, sy*cp, -sy*sp, cy*cp};
+}
+
+static RR_Q4 camera_blend(RR_Q4 from, RR_Q4 to, int smooth, DWORD elapsed) {
+    if (smooth <= 0) return to;
+    const float norm = sqrtf(from.x*from.x + from.y*from.y + from.z*from.z + from.w*from.w);
+    if (!(norm > 0.5f && norm < 1.5f)) return to;
+    from = (RR_Q4){from.x/norm, from.y/norm, from.z/norm, from.w/norm};
+    float dot = from.x*to.x + from.y*to.y + from.z*to.z + from.w*to.w;
+    if (dot < 0.0f) {
+        to = (RR_Q4){-to.x,-to.y,-to.z,-to.w};
+        dot = -dot;
+    }
+    const float mix = 1.0f - expf(-(float)elapsed / (12.0f + 8.0f*smooth));
+    float a = 1.0f - mix, b = mix;
+    if (dot < 0.9995f) {
+        const float angle = acosf(dot), inverse = 1.0f / sinf(angle);
+        a = sinf(a*angle) * inverse;
+        b = sinf(b*angle) * inverse;
+    }
+    RR_Q4 q = {a*from.x+b*to.x, a*from.y+b*to.y, a*from.z+b*to.z, a*from.w+b*to.w};
+    const float length = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    return (RR_Q4){q.x/length,q.y/length,q.z/length,q.w/length};
+}
+
+/* Bound one rendered step to a plausible angular velocity. The smoothing
+ * blend alone still allows an instant 180-degree snap when smooth is 0; the
+ * server sees the resulting view delta and can flag it even though the write
+ * happens inside the game's own camera code. Slerp toward the goal only as far
+ * as the cap allows. */
+static RR_Q4 camera_limit_turn(RR_Q4 from, RR_Q4 to, float max_deg) {
+    if (!(max_deg > 0.0f)) return to;
+    const float fn = sqrtf(from.x*from.x + from.y*from.y + from.z*from.z + from.w*from.w);
+    const float tn = sqrtf(to.x*to.x + to.y*to.y + to.z*to.z + to.w*to.w);
+    if (!(fn > 0.5f && fn < 1.5f) || !(tn > 0.5f && tn < 1.5f)) return to;
+    from = (RR_Q4){from.x/fn, from.y/fn, from.z/fn, from.w/fn};
+    to = (RR_Q4){to.x/tn, to.y/tn, to.z/tn, to.w/tn};
+    float dot = from.x*to.x + from.y*to.y + from.z*to.z + from.w*to.w;
+    if (dot < 0.0f) {
+        to = (RR_Q4){-to.x, -to.y, -to.z, -to.w};
+        dot = -dot;
+    }
+    if (dot > 0.999999f) return to;
+    const float angle = 2.0f * acosf(fminf(1.0f, dot));
+    const float max_rad = max_deg * 3.14159265f / 180.0f;
+    if (angle <= max_rad) return to;
+    const float s = sinf(angle);
+    if (!(fabsf(s) > 1e-6f)) return to;
+    const float t = max_rad / angle;
+    const float a = sinf((1.0f - t) * angle) / s;
+    const float b = sinf(t * angle) / s;
+    RR_Q4 q = {a*from.x+b*to.x, a*from.y+b*to.y, a*from.z+b*to.z, a*from.w+b*to.w};
+    const float length = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (!(length > 1e-6f)) return to;
+    return (RR_Q4){q.x/length, q.y/length, q.z/length, q.w/length};
+}
+
+static RR_V3 camera_rotate(RR_Q4 q, RR_V3 v) {
+    const RR_V3 t = {2*(q.y*v.z-q.z*v.y), 2*(q.z*v.x-q.x*v.z), 2*(q.x*v.y-q.y*v.x)};
+    return (RR_V3){v.x+q.w*t.x+q.y*t.z-q.z*t.y,
+                   v.y+q.w*t.y+q.z*t.x-q.x*t.z,
+                   v.z+q.w*t.z+q.x*t.y-q.y*t.x};
+}
+
+/* Push the final camera rotation into the game's own look input, so the shot
+ * direction matches the rendered camera rather than lagging behind it. */
+static void camera_apply_look(RR_Q4 rotation, uint64_t world) {
+    const uint64_t battle = g_battle, model = g_battle_model;
+    if (!PL(battle) || rr_u64(battle + RR_OFF_BATTLE_WORLD) != world ||
+        !class_named(rr_u64(model), "BattleModel") ||
+        rr_u64(model + RR_OFF_BATTLE_ENTITIES) != battle) return;
+    const uint64_t input = rr_u64(model + RR_OFF_BATTLE_ROTATION);
+    if (!u_is(input, "PlayerRotationInputModel")) return;
+
+    const RR_V3 forward = camera_rotate(rotation, (RR_V3){0,0,1});
+    const float yaw = atan2f(forward.x, forward.z);
+    const float pitch = -atan2f(forward.y, hypotf(forward.x, forward.z));
+    if (!isfinite(yaw) || !isfinite(pitch)) return;
+
+    __try {
+        ((RR_SET_ROTATION)(uintptr_t)(g_module + RR_RVA_SET_PLAYER_ROTATION))
+            (input, yaw, pitch, 0.0f, NULL);
+        const uint64_t battle_input = rr_u64(model + RR_OFF_BATTLE_INPUT);
+        if (u_is(battle_input, "BattleInputModel")) {
+            const float angles[2] = { yaw, pitch };
+            uint64_t packed;
+            memcpy(&packed, angles, sizeof packed);  /* System.Numerics.Vector2 by value */
+            ((RR_SET_LOOK)(uintptr_t)(g_module + RR_RVA_BATTLE_INPUT_SET_LOOK))
+                (battle_input, packed, NULL);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void camera_push(uint64_t brain, void* state, void* method);
+
+static int patch_scene_call(uint64_t word, unsigned offset, const unsigned char expected[8],
+                            uintptr_t callback) {
+    const uint64_t site = word+offset;
+    unsigned char original[8];
+    if (offset > 3 || !rr_read(word, original, sizeof original) ||
+        memcmp(original, expected, sizeof original)) return 0;
+
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    const uint64_t step = info.dwAllocationGranularity;
+    const uint64_t aligned = site - site % step;
+    unsigned char* relay = NULL;
+    for (uint64_t distance = step; distance < 0x40000000 && !relay; distance += step) {
+        const uint64_t hint = aligned + distance;
+        MEMORY_BASIC_INFORMATION region;
+        if (VirtualQuery((void*)(uintptr_t)hint, &region, sizeof region) && region.State == MEM_FREE)
+            relay = VirtualAlloc((void*)(uintptr_t)hint, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    }
+    if (!relay) return 0;
+    unsigned char jump[14] = { 0xFF, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    memcpy(jump + 6, &callback, sizeof callback);
+    memcpy(relay, jump, sizeof jump);
+    DWORD old;
+    if (!VirtualProtect(relay, 4096, PAGE_EXECUTE_READ, &old) ||
+        !FlushInstructionCache(GetCurrentProcess(), relay, sizeof jump)) {
+        VirtualFree(relay, 0, MEM_RELEASE);
+        return 0;
+    }
+
+    const int32_t displacement = (int32_t)((int64_t)(uintptr_t)relay - (int64_t)(site + 5));
+    memcpy(original + offset + 1, &displacement, sizeof displacement);
+    LONG64 replacement, previous;
+    memcpy(&replacement, original, sizeof replacement);
+    memcpy(&previous, expected, sizeof previous);
+    if (!VirtualProtect((void*)(uintptr_t)word, sizeof replacement, PAGE_EXECUTE_READWRITE, &old)) {
+        VirtualFree(relay, 0, MEM_RELEASE);
+        return 0;
+    }
+    const LONG64 actual = InterlockedCompareExchange64((volatile LONG64*)(uintptr_t)word,
+                                                       replacement, previous);
+    FlushInstructionCache(GetCurrentProcess(), (const void*)(uintptr_t)word, sizeof replacement);
+    DWORD unused;
+    VirtualProtect((void*)(uintptr_t)word, sizeof replacement, old, &unused);
+    if (actual != previous) {
+        VirtualFree(relay, 0, MEM_RELEASE);
+        return 0;
+    }
+    return 1;
+}
+
+static int unity_scene_build(uint64_t* module) {
+    uint32_t size = 0;
+    if (!rr_module("GameAssembly.dll", module, &size) || *module != g_module) {
+        dlog("camera: GameAssembly not resolved (base=0x%llX want=0x%llX)",
+             (unsigned long long)(module ? *module : 0), (unsigned long long)g_module);
+        return 0;
+    }
+    const uint32_t pe_header = (uint32_t)rr_i32(*module + 0x3C);
+    const uint32_t stamp = (pe_header >= 0x40 && pe_header <= 0x1000)
+        ? (uint32_t)rr_i32(*module + pe_header + 8) : 0;
+    if (size != RR_CAM_BUILD_SIZE || stamp != RR_CAM_BUILD_TIMESTAMP) {
+        dlog("camera: image mismatch size=0x%X (want 0x%X) stamp=0x%X (want 0x%X)",
+             size, RR_CAM_BUILD_SIZE, stamp, RR_CAM_BUILD_TIMESTAMP);
+        return 0;
+    }
+    return 1;
+}
+
+/* One patch attempt, then a five second backoff. A failed attempt must not
+ * turn every aim frame into another VirtualProtect pass. */
+static volatile LONG g_camera_hook_state;   /* 0 untried, 1 installed, -1 failed */
+static DWORD g_camera_hook_failed_at;
+static volatile DWORD g_camera_applied_at;  /* last push that carried our rotation */
+
+int game_cam_hook_state(void) {
+    const LONG state = InterlockedCompareExchange(&g_camera_hook_state, 0, 0);
+    return state > 0 && g_camera_applied_at ? 2 : (int)state;
+}
+
+static int install_camera_push(void) {
+    const LONG current = InterlockedCompareExchange(&g_camera_hook_state, 0, 0);
+    if (current > 0) return 1;
+    if (current < 0 && GetTickCount() - g_camera_hook_failed_at < 5000) return 0;
+    uint64_t module;
+    if (!unity_scene_build(&module)) {
+        g_camera_hook_failed_at = GetTickCount();
+        InterlockedExchange(&g_camera_hook_state, -1);
+        dlog("camera: GameAssembly image does not match the camera-hook build");
+        return 0;
+    }
+    static const unsigned char expected[] = {0xE8,0x83,0,0,0,0x48,0x8D,0x8F};
+    const int ok = patch_scene_call(module + RR_RVA_BRAIN_PUSH_CALL, 0, expected,
+                                    (uintptr_t)camera_push);
+    if (ok) {
+        InterlockedExchange(&g_camera_hook_state, 1);
+        dlog("camera: push hook installed");
+    } else {
+        g_camera_hook_failed_at = GetTickCount();
+        InterlockedExchange(&g_camera_hook_state, -1);
+        dlog("camera: push call did not match; mouse aim stays active");
+    }
+    return ok;
+}
+
+static void camera_push(uint64_t brain, void* state, void* method) {
+    RR_PUSH_CAMERA push = (RR_PUSH_CAMERA)(uintptr_t)(g_module + RR_RVA_BRAIN_PUSH_STATE);
+    const uint64_t world = g_world, model = g_cam_obj;
+    const uint64_t active_brain = cl_brain();
+    if (!state || !PL(world) || !PL(model) || (active_brain && active_brain != brain)) {
+        push(brain, state, method);
+        return;
+    }
+
+    unsigned char adjusted[RR_CAM_STATE_SIZE];
+    memcpy(adjusted, state, sizeof adjusted);
+    RR_V3 pos, correction;
+    RR_Q4 rotation;
+    memcpy(&pos, adjusted + RR_CAM_STATE_POS, sizeof pos);
+    memcpy(&correction, adjusted + RR_CAM_STATE_CORRECTION, sizeof correction);
+    memcpy(&rotation, adjusted + RR_CAM_STATE_ROT, sizeof rotation);
+    pos.x += correction.x; pos.y += correction.y; pos.z += correction.z;
+
+    RR_V3 model_pos;
+    const int pose_matches = rr_read(model + RR_OFF_CAM_POS, &model_pos, sizeof model_pos) &&
+        hypotf(hypotf(pos.x-model_pos.x, pos.y-model_pos.y), pos.z-model_pos.z) < 8.0f;
+
+    const DWORD now = GetTickCount();
+    AcquireSRWLockShared(&g_camera_state_lock);
+    const uint64_t target_id = g_camera_target_id;
+    const RR_V3 target = g_camera_target;
+    const int smooth = g_camera_smooth;
+    const int max_dps = g_camera_max_dps;
+    const int locked = target_id && g_camera_target_model == model &&
+                       g_camera_target_world == world &&
+                       now - g_camera_target_at <= 100;
+    ReleaseSRWLockShared(&g_camera_state_lock);
+
+    unsigned blend_hint;
+    memcpy(&blend_hint, adjusted + RR_CAM_STATE_BLEND_HINT, sizeof blend_hint);
+    int changed = 0, aimed = 0;
+    static uint64_t previous_brain, previous_world, previous_model, previous_target;
+    static DWORD previous_at;
+    static RR_Q4 previous_rotation;
+    if (locked && pose_matches && !(blend_hint & 3u)) {
+        const float dx = target.x-pos.x, dy = target.y-pos.y, dz = target.z-pos.z;
+        const float horizontal = hypotf(dx, dz);
+        if (isfinite(horizontal) && isfinite(dy) && horizontal > 0.01f) {
+            const RR_Q4 goal = camera_look(atan2f(dx, dz), -atan2f(dy, horizontal));
+            const DWORD elapsed = now - previous_at;
+            const int continuous = target_id == previous_target && brain == previous_brain &&
+                                   model == previous_model && world == previous_world &&
+                                   elapsed <= 100;
+            const RR_Q4 base = continuous ? previous_rotation : rotation;
+            rotation = camera_blend(base, goal, smooth, continuous ? elapsed : 8);
+            if (max_dps > 0) {
+                /* Cap the step from the rotation that was actually rendered,
+                 * not from the freshly blended value. A long frame (a stall,
+                 * an alt-tab) is clamped so it cannot become a giant jump. */
+                float dt = continuous ? (float)elapsed : 8.0f;
+                if (dt > 33.0f) dt = 33.0f;
+                rotation = camera_limit_turn(base, rotation,
+                                             (float)max_dps * dt * 0.001f);
+            }
+            const RR_Q4 rotation_correction = {0,0,0,1};
+            memcpy(adjusted + RR_CAM_STATE_ROT, &rotation, sizeof rotation);
+            memcpy(adjusted + RR_CAM_STATE_ROT_CORRECTION, &rotation_correction,
+                   sizeof rotation_correction);
+            const float dutch = 0.0f;
+            memcpy(adjusted + RR_CAM_STATE_DUTCH, &dutch, sizeof dutch);
+            changed = 1;
+            aimed = 1;
+        }
+    }
+    previous_target = aimed ? target_id : 0;
+    previous_model = model;
+    previous_world = world;
+    previous_brain = brain;
+    previous_at = now;
+    previous_rotation = rotation;
+    if (aimed) {
+        g_camera_applied_at = now;
+        camera_apply_look(rotation, world);
+    }
+    push(brain, changed ? adjusted : state, method);
+}
+
+int game_cam_track(const RR_CAMERA* cam, uint64_t target_id, RR_V3 target,
+                   int smooth, int max_dps) {
+    if (!cam || !cam->valid || !cam->model_source || cam->model_source != g_cam_obj ||
+        !isfinite(target.x) || !isfinite(target.y) || !isfinite(target.z) ||
+        !install_camera_push()) return 0;
+    AcquireSRWLockExclusive(&g_camera_state_lock);
+    g_camera_target = target;
+    g_camera_target_id = target_id;
+    g_camera_target_world = g_world;
+    g_camera_smooth = smooth < 0 ? 0 : (smooth > 20 ? 20 : smooth);
+    g_camera_max_dps = max_dps < 0 ? 0 : max_dps;
+    g_camera_target_model = cam->model_source;
+    g_camera_target_at = GetTickCount();
+    ReleaseSRWLockExclusive(&g_camera_state_lock);
+    return 1;
+}
+
+void game_cam_clear(void) {
+    AcquireSRWLockExclusive(&g_camera_state_lock);
+    g_camera_target_model = 0;
+    g_camera_target_id = 0;
+    g_camera_target_at = 0;
+    g_camera_max_dps = 0;
+    ReleaseSRWLockExclusive(&g_camera_state_lock);
+}
+
 /* Init. */
 
 /* VAD discovery. */
@@ -5343,11 +5713,26 @@ static int reuse_mesh_pose(const ENT_CACHE* e, const MOTION* m, RR_PLAYER* p,
         (e->cham_ready && m->cham_root != e->cham_native[0])) return 0;
     float dx = origin.x - m->mesh_origin.x, dy = origin.y - m->mesh_origin.y;
     float dz = origin.z - m->mesh_origin.z;
-    if (dx*dx + dy*dy + dz*dz >= 0.25f) return 0;
+    /* A seated rig moves with the vehicle, so its cached pose can be carried
+     * over a longer gap than a standing one before it is considered stale. */
+    const float limit = p->inveh ? 4.0f : 0.5f;
+    if (!isfinite(dx) || !isfinite(dy) || !isfinite(dz) ||
+        dx*dx + dy*dy + dz*dz >= limit*limit) return 0;
     memcpy(p->bone, m->mesh_bone, sizeof(m->mesh_bone));
     p->nbones=m->mesh_nbones; p->mesh_bones=1; p->full_rig=m->mesh_full_rig;
     memcpy(p->bone_group,m->mesh_group,sizeof(p->bone_group));
     if (p->full_rig) { p->pos=m->mesh_feet; p->head=m->mesh_top; }
+    if (p->inveh) {
+        /* Carry the cached world pose with the current root instead of leaving
+         * the body behind a vehicle that moved since the last good read. */
+        for (int b = 0; b < p->nbones; ++b) {
+            p->bone[b][0] += dx; p->bone[b][1] += dy; p->bone[b][2] += dz;
+        }
+        if (p->full_rig) {
+            p->pos.x += dx; p->pos.y += dy; p->pos.z += dz;
+            p->head.x += dx; p->head.y += dy; p->head.z += dz;
+        }
+    }
     return 1;
 }
 
@@ -5481,7 +5866,9 @@ static void stabilize_published(MOTION* m, RR_PLAYER* p, DWORD now) {
     if (m->pub_valid) {
         DWORD el = now - m->pub_time;
         if (el > 0 && el < 60) {
-            float b = (float)el / ((float)el + 10.0f);
+            /* Short tail: the rendered pose is already smooth, so a long blend
+             * only adds lag to a fast-moving (or seated) target. */
+            float b = (float)el / ((float)el + 3.0f);
             float dx = p->pos.x - m->pub_pos.x, dy = p->pos.y - m->pub_pos.y, dz = p->pos.z - m->pub_pos.z;
             if (isfinite(dx) && isfinite(dy) && isfinite(dz) && dx*dx + dy*dy + dz*dz < 1.44f) {
                 p->pos.x = m->pub_pos.x + dx * b;
@@ -5503,7 +5890,8 @@ static void stabilize_published(MOTION* m, RR_PLAYER* p, DWORD now) {
 static int build_mesh_bones(const ENT_CACHE* e, RR_PLAYER* p, DWORD now) {
     static int mesh_batch_state;
     if (!PL(e->mesh_h)) return 0;
-    int use_cache=(br_get()->show_skeleton || br_get()->cham_on || br_get()->aim_enabled) && !p->local;
+    int use_cache=(br_get()->enabled || br_get()->show_skeleton || br_get()->cham_on ||
+                   br_get()->aim_enabled) && !p->local;
     MOTION* motion=use_cache ? motion_slot(e->obj) : NULL;
     RR_V3 origin=p->pos;
     if (motion && motion->mesh_valid && motion->mesh_h==e->mesh_h &&
@@ -5572,11 +5960,19 @@ static int build_mesh_bones(const ENT_CACHE* e, RR_PLAYER* p, DWORD now) {
     RR_CAPTURE_LOCAL(e,trs,first,count,now);
 #endif
     filter_arm_branches(e,motion,trs,first,count,now);
+    /* The replicated transform of a seated character can trail the rendered
+     * vehicle pose by more than a metre at speed. The native slot checks above
+     * already prove the rig belongs to this character, so allow a wider window
+     * while seated instead of rejecting the pose and snapping the box back to
+     * the 20 Hz transform. */
+    const float tol_xz = p->inveh ? 12.0f : 2.0f;
+    const float tol_y  = p->inveh ? 8.0f : 3.0f;
     for (int i = 0; i < 5; ++i) {
         int index = e->mesh_idx[i] - first;
         if (index < 0 || index >= count || !PL(e->mesh_native[i]) || slots[index] != e->mesh_native[i]) return 0;
         if (!mesh_point(trs, hierarchy, count, index, &pt[i])) return 0;
-        if (fabsf(pt[i].x-p->pos.x)>2 || fabsf(pt[i].y-p->pos.y)>3 || fabsf(pt[i].z-p->pos.z)>2) return 0;
+        if (fabsf(pt[i].x-p->pos.x)>tol_xz || fabsf(pt[i].y-p->pos.y)>tol_y ||
+            fabsf(pt[i].z-p->pos.z)>tol_xz) return 0;
     }
     RR_V3 chain[7] = { pt[4], pt[4], pt[3], pt[2], pt[1], pt[0], pt[0] };
     chain[1].y += p->crouch == 1 ? 0.48f : 0.88f; /* pelvis estimate */
@@ -5589,6 +5985,14 @@ static int build_mesh_bones(const ENT_CACHE* e, RR_PLAYER* p, DWORD now) {
     p->bone_group[0]=5; p->bone_group[1]=4; p->bone_group[2]=3; p->bone_group[3]=1;
     p->mesh_bones=1;
     if (e->cham_ready && !build_cham_skin(e,p,trs,hierarchy,slots,first,count)) {
+        /* build_cham_skin() clears p->bone before it samples the full rig. On
+         * failure the validated seven-joint chain is still the best pose we
+         * have; restore it so the in-process box and skeleton stay on the rig
+         * instead of snapping back to the replicated transform. */
+        for (int i = 0; i < 7; ++i) {
+            p->bone[i][0]=chain[i].x; p->bone[i][1]=chain[i].y; p->bone[i][2]=chain[i].z;
+        }
+        p->nbones=7; p->full_rig=0; p->mesh_bones=1;
         /* A single failed sample should not blink the cham off; reuse the last
          * good pose when it is recent and belongs to the same rig. */
         if (motion && motion->mesh_cham_valid && motion->cham_root == e->cham_native[0] &&
@@ -5597,8 +6001,7 @@ static int build_mesh_bones(const ENT_CACHE* e, RR_PLAYER* p, DWORD now) {
             p->cham_valid = 1;
             p->cham_sample_at = motion->cham_time;
         } else {
-            p->cham_valid=0; p->nbones=0; p->full_rig=0; p->mesh_bones=0;
-            return 0;
+            p->cham_valid=0;
         }
     }
     if (p->cham_valid) {
@@ -6272,16 +6675,23 @@ static int snapshot_read(RR_PLAYER* out, int max, RR_CAMERA* cam) {
         m->t = tnow;
         m->ok = 1;
         RR_V3 sampled_pos = { f[0], f[1], f[2] };
+        RR_V3 replicated_vel = { 0.0f, 0.0f, 0.0f };
+        int replicated_vel_valid = 0;
+        unsigned replicated_lead_ms = 0;
 
         RR_PLAYER* p = &out[written];
         memset(p, 0, sizeof(*p));
         p->addr = snap[i].obj;
         p->id = snap[i].id;
+        /* rr_player_prone only derives a stance while the field is unknown.
+         * Zero from the memset would look like a confirmed standing value and
+         * leave the ignore-prone switch with nothing to filter. */
+        p->prone = -1;
         if (snap[i].cham_ready) p->cham_rig = snap[i].cham_native[0];
         p->health = -1;
         /* Health feeds the aim and trigger filters as well as the bar: a corpse
-         * reads zero and must never win a target pick, even when the health
-         * column is hidden. */
+         * reads zero and is filtered by the ignore-dead switch even when the
+         * health column is hidden. */
         if (cfg->show_health || cfg->aim_enabled || cfg->trigger_enabled) {
             uint64_t data = rr_u64(snap[i].obj + RR_OFF_CHAR_DATA);
             uint64_t private_data = PL(data) ? rr_u64(data + RR_OFF_DATA_PRIVATE) : 0;
@@ -6302,6 +6712,7 @@ static int snapshot_read(RR_PLAYER* out, int max, RR_CAMERA* cam) {
         }
         p->armor = snap[i].armor;
         p->crouch = snap[i].crouch;
+        p->knocked = snap[i].knocked;
         p->local = snap[i].local;
         p->is_npc = snap[i].is_npc;
         if (cfg->show_spread_visualizer && p->local == RR_LOCAL_CONFIRMED)
@@ -6323,7 +6734,9 @@ static int snapshot_read(RR_PLAYER* out, int max, RR_CAMERA* cam) {
         p->pos.x = f[0]; p->pos.y = f[1]; p->pos.z = f[2];
         p->rot_yaw = f[4];
         p->head = p->pos;
-        p->head.y += (snap[i].crouch == 1) ? 1.05f : 1.75f;
+        /* A seated body is much shorter than the standing estimate; 1.75 m
+         * puts the box through the vehicle roof when the rig is unavailable. */
+        p->head.y += (snap[i].crouch == 1) ? 1.05f : (p->inveh ? 1.45f : 1.75f);
         if(p->hidden_in_object)p->head=snap[i].hidden_anchor;
 
         /* Lead the replicated transform to the present. This runs before the
@@ -6358,9 +6771,26 @@ static int snapshot_read(RR_PLAYER* out, int max, RR_CAMERA* cam) {
                     p->pos.y += s->vel.y * lead_s;
                     p->pos.z += s->vel.z * lead_s;
                     p->head = p->pos;
-                    p->head.y += (snap[i].crouch == 1) ? 1.05f : 1.75f;
+                    p->head.y += (snap[i].crouch == 1) ? 1.05f : (p->inveh ? 1.45f : 1.75f);
+                    replicated_lead_ms = lead;
                     ++ex_n;
                 }
+            }
+            /* The replicated transform is the stable velocity source for aim:
+             * rig bones are current, but a vehicle or a runner moves the whole
+             * body and the raw transform still carries that motion at 20 Hz.
+             * After a stop the last sample ages out instead of leading forever. */
+            DWORD vel_age = pose_now - s->changed;
+            float v2 = s->vel.x * s->vel.x + s->vel.y * s->vel.y + s->vel.z * s->vel.z;
+            if (vel_age <= 100 && isfinite(v2) && v2 <= 40.0f * 40.0f) {
+                /* The replicated transform normally changes every ~50 ms. If it
+                 * goes quiet the body has stopped (or the stream stalled): fade
+                 * the last velocity out instead of leading a parked target. */
+                float keep = vel_age <= 60 ? 1.0f : (100.0f - (float)vel_age) / 40.0f;
+                replicated_vel.x = s->vel.x * keep;
+                replicated_vel.y = s->vel.y * keep;
+                replicated_vel.z = s->vel.z * keep;
+                replicated_vel_valid = 1;
             }
         }
 
@@ -6370,8 +6800,11 @@ static int snapshot_read(RR_PLAYER* out, int max, RR_CAMERA* cam) {
             if (p->nbones) memcpy(p->bone_group, g_skelcfg.group, sizeof(p->bone_group));
         }
         int mesh_ok=0;
-        if (!p->hidden_in_object && (cfg->enabled || cfg->aim_enabled) && snap[i].mesh_h &&
-            (!p->inveh || cfg->cham_on || cfg->aim_enabled)) {
+        /* Seated players need the rendered rig just as much as standing ones:
+         * the replicated transform trails the vehicle and a fixed-height head
+         * estimate puts the box through the roof. The native slot checks in
+         * build_mesh_bones() still reject a recycled rig. */
+        if (!p->hidden_in_object && (cfg->enabled || cfg->aim_enabled) && snap[i].mesh_h) {
             /* A malformed or recycled rig must not suppress every ESP marker. */
             if (g_pose_diag_enabled && !p->local) ++g_pose_diag.attempts;
             __try { mesh_ok=build_mesh_bones(&snap[i],p,pose_now); }
@@ -6380,8 +6813,12 @@ static int snapshot_read(RR_PLAYER* out, int max, RR_CAMERA* cam) {
         }
         else if (g_pose_diag_enabled && !p->local && !p->hidden_in_object && !snap[i].mesh_h) ++g_pose_diag.missing_rig;
         if (!mesh_ok && !p->hidden_in_object && !p->local &&
-            (cfg->show_skeleton || cfg->cham_on || cfg->aim_enabled)) {
-            mesh_ok = reuse_mesh_pose(&snap[i], m, p, sampled_pos, pose_now);
+            (cfg->enabled || cfg->show_skeleton || cfg->cham_on || cfg->aim_enabled)) {
+            /* build_mesh_bones() recorded the lead-corrected root; compare
+             * against the same value so a moving seated target is not treated
+             * as a stale rig on every other frame. */
+            mesh_ok = reuse_mesh_pose(&snap[i], m, p,
+                                      p->inveh ? p->pos : sampled_pos, pose_now);
             if (g_pose_diag_enabled && mesh_ok) ++g_pose_diag.reused_mesh;
         }
         if (mesh_ok && !p->full_rig) {
@@ -6397,6 +6834,12 @@ static int snapshot_read(RR_PLAYER* out, int max, RR_CAMERA* cam) {
             reuse_cham_pose(&snap[i], m, p, sampled_pos, pose_now);
             if (g_pose_diag_enabled && p->cham_valid) ++g_pose_diag.reused_cham;
         }
+        p->vel = replicated_vel;
+        p->vel_valid = replicated_vel_valid;
+        /* The seven-joint fallback is built on the lead-corrected position;
+         * a live rig pose is already current. Aim must not add the same lead
+         * twice when it extrapolates this point. */
+        p->lead_ms = mesh_ok ? 0u : replicated_lead_ms;
         p->valid = 1;
         written++;
     }
@@ -6540,9 +6983,27 @@ void rr_player_prone(RR_PLAYER* players, int count) {
     if (count > RR_MAX_PLAYERS) count = RR_MAX_PLAYERS;
     for (int i = 0; i < count; ++i) {
         RR_PLAYER* p = &players[i];
-        if (p->prone >= 0) continue;
         if (p->is_vehicle || p->is_loot) { p->prone = 0; continue; }
+        /* An explicit knockout wins over the rig test. A knocked body can be
+         * folded into a seat or a ragdoll whose head still reads above the
+         * 0.70 m threshold, which is exactly the case Ignore prone missed. */
+        if (p->knocked) { p->prone = 1; continue; }
+        if (p->prone >= 0) continue;
         if (p->crouch == 2) { p->prone = 1; continue; }
+        /* A resolved rig separates a flat body from a crouched one better than
+         * the fixed-height head estimate: the head-to-pelvis span collapses
+         * when the body is on the ground. Seated bodies fold into a short span
+         * too, so they are excluded. */
+        if (!p->inveh && p->crouch != 1 && p->nbones > 0) {
+            const int hb = p->bone_group[0], pb = p->bone_group[3];
+            if (hb >= 0 && pb >= 0 && hb < p->nbones && pb < p->nbones) {
+                const float dy = fabsf(p->bone[hb][1] - p->bone[pb][1]);
+                if (isfinite(dy) && dy > 0.05f) {
+                    p->prone = (dy < 0.30f) ? 1 : 0;
+                    continue;
+                }
+            }
+        }
         if (!isfinite(p->head.y) || !isfinite(p->pos.y)) { p->prone = -1; continue; }
         const float span = p->head.y - p->pos.y;
         if (span <= 0.05f) { p->prone = -1; continue; }

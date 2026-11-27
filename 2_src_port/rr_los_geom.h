@@ -3,6 +3,9 @@
 #define RR_LOS_GEOM_H
 #include <stdint.h>
 #include "rr_game.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 enum { RR_LOS_UNKNOWN=-1, RR_LOS_BLOCKED=0, RR_LOS_CLEAR=1 };
 typedef struct { float min[3],max[3]; int parent,left,right,body; } RR_LOS_NODE;
@@ -32,4 +35,7 @@ int rr_los_box_segment(RR_V3 start, RR_V3 end, const RR_LOS_BOX* box);
 int rr_los_triangle_segment(RR_V3 start, RR_V3 end, const RR_LOS_TRI* triangle);
 int rr_los_capsule_segment(RR_V3 start, RR_V3 end, const RR_LOS_CAPSULE* capsule);
 int rr_los_hull_segment(RR_V3 start, RR_V3 end, const RR_LOS_HULL* hull, const RR_LOS_HULL_DATA* data);
+#ifdef __cplusplus
+}
+#endif
 #endif

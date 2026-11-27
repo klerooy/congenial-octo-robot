@@ -18,13 +18,17 @@ extern "C" {
 
 /* Lifecycle. */
 int  rr_drv_open(void);          /* 1 = device open and session key loaded   */
+/* Open the in-process transport used by the internal payload: reads and writes
+ * are direct copies on the calling thread, with no device, registry lookup or
+ * process handle. Safe to call before any read. */
+int  rr_drv_open_self(void);
 /* Supplies the per-thread cell rr_read records its status in. The payload points
  * this at its own per-thread block; without it the status is process-wide. */
 void rr_mem_ok_provider(int* (*fn)(void));
 void rr_drv_close(void);
 int  rr_drv_live(void);          /* 1 = a successful read happened           */
-int  rr_drv_ready(void);         /* 1 = a transport is open (device or user) */
-const char* rr_transport(void);  /* "device", "user", or "none"              */
+int  rr_drv_ready(void);         /* 1 = a transport is open (device/user/self) */
+const char* rr_transport(void);  /* "device", "user", "self", or "none"      */
 
 /* Request process hiding (hide != 0) or restoration (hide == 0) through
  * WM_IO_VEIL. Return 1 if the driver accepts the request, otherwise 0.

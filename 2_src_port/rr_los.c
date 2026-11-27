@@ -16,6 +16,7 @@ static RR_LOS_CAPTURE* g_static;
 static RR_LOS_RUNTIME* g_runtime;
 static uint64_t g_world_id,g_data_id;
 static DWORD g_static_time,g_runtime_time;
+static DWORD g_last_static,g_last_runtime;
 static volatile LONG g_running;
 static HANDLE g_thread;
 
@@ -35,59 +36,73 @@ static int source(uint64_t* world_out,uint64_t* data_out) {
     if(world!=game_world_addr()||battle!=current_battle)return 0;
     *world_out=world;*data_out=data;return 1;
 }
+/* One capture iteration. The external overlay runs it on its own worker; the
+ * in-process payload calls rr_los_pump from Present because a thread created
+ * inside the protected game is killed before it executes. */
+static int los_pump_once(void) {
+    BR_Config* cfg=br_get();
+    int wanted=(cfg->aim_enabled && (cfg->aa_los_on || cfg->aim_legit)) ||
+               (cfg->trigger_enabled && cfg->trigger_los);
+    if(!wanted) { InterlockedExchange((volatile LONG*)&cfg->telem_los_state,0);return 0; }
+    uint64_t world=0,data=0;
+    if(!source(&world,&data)) { InterlockedExchange((volatile LONG*)&cfg->telem_los_state,1);return 0; }
+    uint64_t current_tree=rr_u64(data+0x18);
+    int current_root=PL(current_tree)?rr_i32(current_tree+0x18):-1;
+    RR_LOS_CAPTURE* retired=NULL;
+    AcquireSRWLockExclusive(&g_lock);
+    if(world!=g_world_id||data!=g_data_id) { clear_locked();g_world_id=world;g_data_id=data;g_last_static=g_last_runtime=0; }
+    if(g_static && (g_static->tree_identity!=current_tree || g_static->geometry.root!=current_root)) {
+        retired=g_static;g_static=NULL;g_static_time=0;g_last_static=0;
+    }
+    int has_static=g_static!=NULL,has_runtime=g_runtime!=NULL;
+    ReleaseSRWLockExclusive(&g_lock);
+    rr_los_capture_free(retired);
+    DWORD now=GetTickCount();
+    if((!has_static && (!g_last_static || now-g_last_static>=1000)) || (has_static && now-g_last_static>=3000)) {
+        g_last_static=now;RR_LOS_CAPTURE* candidate=rr_los_capture_static(data);
+        uint64_t w2=0,d2=0;
+        if(candidate && source(&w2,&d2) && world==w2 && data==d2) {
+            AcquireSRWLockExclusive(&g_lock);
+            if(g_world_id==world && g_data_id==data) {
+                RR_LOS_CAPTURE* old=g_static;g_static=candidate;candidate=old;g_static_time=GetTickCount();
+            }
+            ReleaseSRWLockExclusive(&g_lock);
+        }
+        rr_los_capture_free(candidate);
+    }
+    now=GetTickCount();
+    if((!has_runtime && (!g_last_runtime || now-g_last_runtime>=500)) || (has_runtime && now-g_last_runtime>=200)) {
+        g_last_runtime=now;RR_LOS_RUNTIME* candidate=rr_los_capture_runtime(data);
+        uint64_t w2=0,d2=0;
+        if(candidate && source(&w2,&d2) && world==w2 && data==d2) {
+            AcquireSRWLockExclusive(&g_lock);
+            if(g_world_id==world && g_data_id==data) {
+                RR_LOS_RUNTIME* old=g_runtime;g_runtime=candidate;candidate=old;g_runtime_time=GetTickCount();
+            }
+            ReleaseSRWLockExclusive(&g_lock);
+        }
+        rr_los_runtime_free(candidate);
+    }
+    AcquireSRWLockShared(&g_lock);
+    now=GetTickCount();
+    int ready=g_static && g_runtime && g_world_id==world && now-g_static_time<5000 && now-g_runtime_time<600;
+    ReleaseSRWLockShared(&g_lock);
+    InterlockedExchange((volatile LONG*)&cfg->telem_los_state,ready?2:1);
+    return 1;
+}
 static DWORD WINAPI los_worker(LPVOID unused) {
-    (void)unused;DWORD last_static=0,last_runtime=0;
+    (void)unused;
     while(InterlockedCompareExchange(&g_running,0,0)) {
-        BR_Config* cfg=br_get();
-        if(!(cfg->aim_enabled && cfg->aa_los_on) && !cfg->trigger_enabled) { InterlockedExchange((volatile LONG*)&cfg->telem_los_state,0);Sleep(100);continue; }
-        uint64_t world=0,data=0;
-        if(!source(&world,&data)) { InterlockedExchange((volatile LONG*)&cfg->telem_los_state,1);Sleep(100);continue; }
-        uint64_t current_tree=rr_u64(data+0x18);
-        int current_root=PL(current_tree)?rr_i32(current_tree+0x18):-1;
-        RR_LOS_CAPTURE* retired=NULL;
-        AcquireSRWLockExclusive(&g_lock);
-        if(world!=g_world_id||data!=g_data_id) { clear_locked();g_world_id=world;g_data_id=data;last_static=last_runtime=0; }
-        if(g_static && (g_static->tree_identity!=current_tree || g_static->geometry.root!=current_root)) {
-            retired=g_static;g_static=NULL;g_static_time=0;last_static=0;
-        }
-        int has_static=g_static!=NULL,has_runtime=g_runtime!=NULL;
-        ReleaseSRWLockExclusive(&g_lock);
-        rr_los_capture_free(retired);
-        DWORD now=GetTickCount();
-        if((!has_static && (!last_static || now-last_static>=1000)) || (has_static && now-last_static>=3000)) {
-            last_static=now;RR_LOS_CAPTURE* candidate=rr_los_capture_static(data);
-            uint64_t w2=0,d2=0;
-            if(candidate && source(&w2,&d2) && world==w2 && data==d2) {
-                AcquireSRWLockExclusive(&g_lock);
-                if(g_world_id==world && g_data_id==data) {
-                    RR_LOS_CAPTURE* old=g_static;g_static=candidate;candidate=old;g_static_time=GetTickCount();
-                }
-                ReleaseSRWLockExclusive(&g_lock);
-            }
-            rr_los_capture_free(candidate);
-        }
-        now=GetTickCount();
-        if((!has_runtime && (!last_runtime || now-last_runtime>=500)) || (has_runtime && now-last_runtime>=200)) {
-            last_runtime=now;RR_LOS_RUNTIME* candidate=rr_los_capture_runtime(data);
-            uint64_t w2=0,d2=0;
-            if(candidate && source(&w2,&d2) && world==w2 && data==d2) {
-                AcquireSRWLockExclusive(&g_lock);
-                if(g_world_id==world && g_data_id==data) {
-                    RR_LOS_RUNTIME* old=g_runtime;g_runtime=candidate;candidate=old;g_runtime_time=GetTickCount();
-                }
-                ReleaseSRWLockExclusive(&g_lock);
-            }
-            rr_los_runtime_free(candidate);
-        }
-        AcquireSRWLockShared(&g_lock);
-        now=GetTickCount();
-        int ready=g_static && g_runtime && g_world_id==world && now-g_static_time<5000 && now-g_runtime_time<600;
-        ReleaseSRWLockShared(&g_lock);
-        InterlockedExchange((volatile LONG*)&cfg->telem_los_state,ready?2:1);
-        Sleep(40);
+        if(!los_pump_once()) Sleep(100);
+        else Sleep(40);
     }
     AcquireSRWLockExclusive(&g_lock);clear_locked();ReleaseSRWLockExclusive(&g_lock);
     return 0;
+}
+void rr_los_pump(void) {
+    /* Never race the worker: the external overlay keeps the thread path. */
+    if(InterlockedCompareExchange(&g_running,0,0)) return;
+    los_pump_once();
 }
 int rr_los_start(void) {
     if(InterlockedCompareExchange(&g_running,1,0)!=0)return 1;
@@ -97,7 +112,9 @@ int rr_los_start(void) {
 void rr_los_stop(void) {
     InterlockedExchange(&g_running,0);
     if(g_thread){WaitForSingleObject(g_thread,5000);CloseHandle(g_thread);g_thread=NULL;}
+    g_last_static=g_last_runtime=0;
 }
+int rr_los_available(void) { return 1; }
 int rr_los_check(RR_V3 start,RR_V3 end) {
     int result=RR_LOS_UNKNOWN;
     AcquireSRWLockShared(&g_lock);
@@ -108,5 +125,13 @@ int rr_los_check(RR_V3 start,RR_V3 end) {
         if(b==RR_LOS_BLOCKED)result=RR_LOS_BLOCKED;
         else if(a==RR_LOS_CLEAR && b==RR_LOS_CLEAR)result=RR_LOS_CLEAR;
     }
+    ReleaseSRWLockShared(&g_lock);return result;
+}
+int rr_los_check_static(RR_V3 start,RR_V3 end) {
+    int result=RR_LOS_UNKNOWN;
+    AcquireSRWLockShared(&g_lock);
+    DWORD now=GetTickCount();uint64_t world=game_world_addr();
+    if(world && world==g_world_id && g_static && now-g_static_time<5000)
+        result=rr_los_static_trace(&g_static->geometry,start,end);
     ReleaseSRWLockShared(&g_lock);return result;
 }

@@ -34,6 +34,10 @@ static void cfg_defaults(void) {
     g_cfg.show_skeleton = 0;
     g_cfg.cham_on = 0;
     g_cfg.aim_enabled = 0;
+    /* The collision capture modules are linked into this payload and pumped
+     * from Present, so the visible-only filter can be on from the start. */
+    g_cfg.aa_los_on = 1;
+    g_cfg.trigger_los = 1;
     g_cfg.show_self = 0;
     g_cfg.show_loot = 0;
     g_cfg.show_loot_nodes = 0;

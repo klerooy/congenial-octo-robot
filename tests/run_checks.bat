@@ -2,6 +2,7 @@
 setlocal
 set "VS="
 for %%P in (
+    "C:\Program Files\Microsoft Visual Studio\18\Insiders"
     "C:\Program Files\Microsoft Visual Studio\18\Community"
     "C:\Program Files\Microsoft Visual Studio\18\Professional"
     "C:\Program Files\Microsoft Visual Studio\2022\Community"

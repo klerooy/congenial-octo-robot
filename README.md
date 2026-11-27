@@ -20,6 +20,7 @@ managed runtime is traversed directly (`rr_unity.c`, `rr_classscan.c`, `rr_nodes
 | `tests/` | offline regression checks (`verify_changes.py` compiles and runs the aim suites) |
 | `docs/il2cpp_signatures.md` | static harvest of the installed build: metadata layout, method-address walk, invocation transport, live status |
 | `docs/chatgpt_brief.md` | architecture review brief: 8 problems, evidence, backlog |
+| `docs/driverless_launch.md` | the WmPort-free launch path, cleanup steps and the remaining file/HWID notes |
 | `tools/harvest_il2cpp.py` | static metadata reader used to produce the tables above |
 
 ## Build
@@ -29,22 +30,50 @@ Windows x64, MSVC (VS 2022/2026 detection is in the script), no package manager:
 ```bat
 2_src_port\build_int.bat
 :: BUILD_OK -> rr_int.dll (copied to ..\1_run)
+
+2_src_port\build_safe.bat
+:: BUILD_OK -> RRSafe.exe (copied to ..\1_run)
 ```
 
 `/Brepro` is set on the compiler and the linker, so the same tree produces the
 same bytes and a published SHA-256 means something.
 
+## Driverless internal launch
+
+The internal payload no longer opens `\Device\WmPort`, reads
+`HKLM\SYSTEM\WmPort` or sends IOCTLs: `rr_mem.c` is compiled with
+`RR_SELF_ONLY` and every read/write is a guarded copy in the game process
+(`transport: self`). `RRSafe.exe` starts the game directly, maps `rr_int.dll`
+with `rr_safemap.c` during early startup, and lets the game continue. No driver
+is mapped and no file is placed in the game folder.
+
+```bat
+1_run\RRSafe.exe --find     :: print the discovered game path
+1_run\RRSafe.exe
+:: or: RRSafe.exe --game "D:\SteamLibrary\steamapps\common\Rob Run\ROB RUN.exe"
+```
+
+Starting `ROB RUN.exe` directly bypasses the `start_protected_game.exe` EAC
+wrapper. If the game refuses to run or cannot go online without EAC, read the
+tradeoff section in `docs/driverless_launch.md` before choosing another path.
+
+See `docs/driverless_launch.md` for switches, the old-driver cleanup and the
+remaining file/HWID notes. The old `RRTool` / `kd2` / `kernel-mode.sys` path
+still works for the external overlay, but it must not be used with this internal
+build if the driver ban vector is to be removed.
+
 ## Tests
 
 ```bat
 tests\run_checks.bat
-:: SELFTEST OK (0 failures)
 :: ALL OFFLINE CHECKS PASSED
 ```
 
 `tests\verify_changes.py` compiles the aim suites against mocks (`SendInput`,
 `GetAsyncKeyState`, `rr_read`, `rr_write`, the clock) and runs closed-loop plants.
-Nothing in the suite touches a game process.
+The external overlay's `--selftest` link runs when its objects and the WebView2
+SDK are present; otherwise that step is reported as skipped. Nothing in the
+suite touches a game process.
 
 ## What exists
 

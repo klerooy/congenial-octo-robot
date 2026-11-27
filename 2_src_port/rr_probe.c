@@ -518,7 +518,7 @@ static int channel_report(void) {
         printf("channel: OP_PROTECT missing - the answering image predates op 0x02 "
                "(stage=0x%X)\n", stage);
         printf("channel: every protection change will be refused; load "
-               "3_src_driver/rr_exec4.sys (dseload) to take the channel with an "
+               "3_src_driver/rr_exec.sys (dseload) to take the channel with an "
                "image that has the op\n");
         return 5;
     }
