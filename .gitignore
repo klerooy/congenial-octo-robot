@@ -4,7 +4,6 @@
 *.lib
 *.exp
 *.pdb
-*.sys
 *.log
 *.ilk
 docs
